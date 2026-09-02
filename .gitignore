@@ -1,0 +1,10 @@
+/.venv/
+/.venv-porta-old/
+/persistent_settings_location.txt
+/porta_user/
+/test_output/
+/.pytest_cache/
+/.ruff_cache/
+**/__pycache__/
+*.py[cod]
+*.egg-info/

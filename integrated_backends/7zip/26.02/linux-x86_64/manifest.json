@@ -1,0 +1,11 @@
+{
+  "backend_id": "bundled-7zzs",
+  "product": "7-Zip",
+  "version": "26.02",
+  "system": "Linux",
+  "machine": "x86_64",
+  "executable": "7zzs",
+  "sha256": "20df89e993594c1bb7686f125dabe1acc56c109fb1d9b40435ea5fcbc1ca3453",
+  "source_archive": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
+  "source_archive_sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e"
+}
