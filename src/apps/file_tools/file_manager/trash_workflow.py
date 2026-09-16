@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from runtime import managed_process
+
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
 
 from foundation.path import path_entry_exists
+from runtime.operation_progress import checkpoint, completed as report_completed
 
 from .copy_workflow import parse_target_paths
 
@@ -55,11 +58,15 @@ def execute_trash_plan(plan: TrashPlan) -> list[Path]:
     """Ask gio to trash each item and stop on the first failure without a destructive fallback."""
     completed: list[Path] = []
     for source in plan.sources:
-        result = subprocess.run(
-            ["gio", "trash", str(source)], capture_output=True, text=True, check=False
+        checkpoint(str(source))
+        result = managed_process.run(
+            ["gio", "trash", str(source)], capture_output=True, text=True, check=False,
+            label='ゴミ箱へ移動中',
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or str(source)
-            raise OSError("ゴミ箱へ送れませんでした。\n" + detail)
+            raise OSError("ゴミ箱へ送れませんでした。\n" + detail
+                          + "\n送信済み:\n" + "\n".join(map(str, completed)))
         completed.append(source)
+        report_completed(source, "OSのゴミ箱", "送信完了")
     return completed

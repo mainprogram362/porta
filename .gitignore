@@ -1,6 +1,6 @@
 /.venv/
 /.venv-porta-old/
-/persistent_settings_location.txt
+/persistent_settings.json
 /porta_user/
 /test_output/
 /.pytest_cache/
@@ -8,3 +8,9 @@
 **/__pycache__/
 *.py[cod]
 *.egg-info/
+
+# Personal FFmpeg binaries kept inside PORTA (not published to GitHub).
+/integrated_backends/ffmpeg/bin/*
+!/integrated_backends/ffmpeg/bin/.gitkeep
+/integrated_backends/veracrypt/VeraCrypt.AppImage
+/integrated_backends/veracrypt/VeraCrypt.AppImage.sig

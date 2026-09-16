@@ -1,47 +1,118 @@
-"""Copy-then-verify move workflow that never deletes sources before validation."""
+"""Filesystem-aware move workflow with safe cross-device copying."""
 
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import shutil
 
-from .copy_workflow import CopyPlan, CopyPreview, build_copy_preview, execute_copy_plan
+from foundation.path import path_entry_exists
+from foundation.safe_transfer import rename_noreplace
+from runtime.operation_progress import checkpoint, completed
+
+from .copy_workflow import (
+    CopyPlan,
+    CopyPreview,
+    PlannedCopy,
+    build_copy_preview,
+    execute_copy_plan,
+    validate_copy_plan_is_current,
+)
 
 
 def build_move_preview(source_text: str, destination_text: str, *, mode: str) -> CopyPreview:
-    """Build a move preview using the same collision-safe plan as copying."""
+    """Build a collision-safe preview and show how each move will be performed."""
     preview = build_copy_preview(source_text, destination_text, mode=mode)
+    text = preview.text.replace("コピー", "移動")
+    if preview.plan is not None:
+        direct_count = sum(_is_same_filesystem(item) for item in preview.plan.copies)
+        copied_count = len(preview.plan.copies) - direct_count
+        text += (
+            "\n\n移動方式:\n"
+            f"・同じファイルシステム内の即時移動: {direct_count} 件\n"
+            f"・別ファイルシステムへのコピー・照合・元削除: {copied_count} 件\n"
+            "実行直前にも全件を検査し、方式を再判定します。"
+        )
     return CopyPreview(
         preview.request,
         preview.plan,
-        preview.text.replace("操作: コピー", "操作: 移動").replace(
-            "コピーします", "コピーして照合後に元を削除します"
-        ),
+        text,
     )
 
 
 def execute_move_plan(plan: CopyPlan) -> list[Path]:
-    """Copy all outputs, verify all trees, then and only then delete all sources."""
-    outputs = execute_copy_plan(plan)
+    """Rename on one filesystem; copy, verify, and remove across filesystems."""
+    # Validate the complete displayed plan before changing even one entry.
+    validate_copy_plan_is_current(plan)
+    direct_moves: list[PlannedCopy] = []
+    copied_moves: list[PlannedCopy] = []
+    for planned in plan.copies:
+        (direct_moves if _is_same_filesystem(planned) else copied_moves).append(planned)
+
+    copied_outputs: list[Path] = []
+    source_identities = {}
+    for item in copied_moves:
+        identity = item.source.lstat()
+        source_identities[item.source] = (identity.st_dev, identity.st_ino)
+    if copied_moves:
+        copied_plan = CopyPlan(request=plan.request, copies=tuple(copied_moves))
+        copied_outputs = execute_copy_plan(copied_plan)
+
     mismatches = [
         planned.source
-        for planned, output in zip(plan.copies, outputs)
+        for planned, output in zip(copied_moves, copied_outputs)
         if not _paths_match(planned.source, output)
     ]
     if mismatches:
         details = "\n".join(str(path) for path in mismatches)
-        raise OSError("コピー後の照合に失敗したため、元データは削除していません。\n" + details)
+        raise OSError(
+            "別ファイルシステムへのコピー後の照合に失敗しました。"
+            "作成した出力は保持し、元データは移動していません。\n" + details
+        )
 
+    renamed: list[PlannedCopy] = []
     try:
-        for planned in plan.copies:
-            _remove_source(planned.source)
+        for planned in direct_moves:
+            checkpoint(str(planned.source))
+            # Do not let os.rename replace something created after the preview.
+            if path_entry_exists(planned.output):
+                raise FileExistsError(f"移動先が実行直前に使用されました: {planned.output}")
+            rename_noreplace(planned.source, planned.output)
+            renamed.append(planned)
+            completed(planned.source, planned.output, "移動完了")
     except OSError as exc:
         raise OSError(
-            "全件の照合後に元データの削除中エラーが発生しました。"
-            "既に削除した元データは復元できません。\n" + str(exc)
+            "同じファイルシステム内の即時移動中にエラーが発生しました。"
+            "完了済みの移動とコピーは保持しています。\n移動済み:\n"
+            + "\n".join(f"{item.source} → {item.output}" for item in renamed)
+            + "\nコピー済み:\n" + "\n".join(map(str, copied_outputs)) + "\n"
+            + str(exc)
         ) from exc
-    return outputs
+
+    try:
+        for planned in copied_moves:
+            checkpoint(str(planned.source))
+            current = planned.source.lstat()
+            if (current.st_dev, current.st_ino) != source_identities[planned.source]:
+                raise OSError(f"コピー後に元の項目が置き換わりました: {planned.source}")
+            if not _paths_match(planned.source, planned.output):
+                raise OSError(f"元削除の直前に内容が変わりました: {planned.source}")
+            _remove_source(planned.source)
+            completed(planned.source, planned.output, "元削除完了")
+    except OSError as exc:
+        raise OSError(
+            "別ファイルシステムへのコピーを全件照合後、元データの削除中にエラーが発生しました。"
+            "既に削除した元データは復元できません。出力はすべて保持しています。\n"
+            + "\n".join(f"{item.source} → {item.output}" for item in copied_moves)
+            + "\n" + str(exc)
+        ) from exc
+    return [planned.output for planned in plan.copies]
+
+
+def _is_same_filesystem(planned: PlannedCopy) -> bool:
+    """Compare the directories whose entries are changed, without following a source link."""
+    return planned.source.parent.stat().st_dev == planned.output.parent.stat().st_dev
 
 
 def _paths_match(source: Path, output: Path) -> bool:
@@ -55,10 +126,21 @@ def _paths_match(source: Path, output: Path) -> bool:
             not output.is_symlink()
             and output.is_file()
             and source.stat().st_size == output.stat().st_size
+            and _digest(source) == _digest(output)
         )
     if not source.is_dir() or not output.is_dir():
         return False
-    return _tree_snapshot(source) == _tree_snapshot(output)
+    snapshot = _tree_snapshot(source)
+    return snapshot is not None and snapshot == _tree_snapshot(output)
+
+
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            checkpoint()
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[str, int | str]] | None:
@@ -78,7 +160,7 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, int | str]] | None:
                         entries[relative] = ("directory", 0)
                         pending.append(path)
                     elif child.is_file(follow_symlinks=False):
-                        entries[relative] = ("file", child.stat(follow_symlinks=False).st_size)
+                        entries[relative] = ("file", _digest(path))
                     else:
                         entries[relative] = ("other", 0)
     except OSError:

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ..layout_policy import set_item_view_rows
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,6 @@ class TextValueWorkspaceDialog(QDialog):
         self._bulk_updating = False
         self._undo_outputs: dict[str, str] | None = None
         self.setWindowTitle(title)
-        self.setMinimumSize(980, 800)
         self._build_ui(rows, default_source_key, default_target_key)
 
     @property
@@ -178,7 +178,6 @@ class TextValueWorkspaceDialog(QDialog):
         layout.addWidget(information_box)
 
         output_box = QGroupBox("出力予定一覧（各行は直接編集できます）")
-        output_box.setMinimumHeight(360)
         output_layout = QVBoxLayout(output_box)
         self.table = QTableWidget(len(rows), 5)
         self.table.setHorizontalHeaderLabels(
@@ -190,7 +189,7 @@ class TextValueWorkspaceDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.setMinimumHeight(310)
+        set_item_view_rows(self.table, minimum=12)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(
             self._TARGET_COLUMN, self.table.horizontalHeader().ResizeMode.ResizeToContents

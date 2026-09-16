@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from runtime import managed_process
+from runtime.runtime_activity import runtime_activity
+
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -64,11 +67,12 @@ class LocalAiSession:
             return
         self._validate_launch_paths()
         self._port = _find_loopback_port()
-        self._process = subprocess.Popen(
+        self._process = managed_process.popen(
             build_server_command(self.runner_path, self.model_path, self._port),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            label='ローカルAI',
         )
 
     def is_ready(self) -> bool:
@@ -81,6 +85,7 @@ class LocalAiSession:
         except (HTTPError, URLError, TimeoutError):
             return False
 
+    @runtime_activity("ローカルAI応答を生成中")
     def chat(self, messages: list[dict[str, str]]) -> str:
         """Submit one non-streaming chat request to the local-only endpoint."""
         payload: dict[str, Any] = {

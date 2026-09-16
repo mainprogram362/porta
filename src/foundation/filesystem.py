@@ -1,4 +1,5 @@
 import os
+import errno
 import shutil
 from pathlib import Path
 from typing import Literal
@@ -6,6 +7,7 @@ from typing import Literal
 import chardet
 
 from .path import PathLike, normalize_path, path_entry_exists
+from .safe_transfer import copy_noreplace, rename_noreplace
 
 
 def ensure_unique_destination(dest: PathLike) -> Path:
@@ -127,7 +129,7 @@ def copy_or_move(
     dest_path = normalize_path(dest)
 
     # 移動先が既存のディレクトリなら、その配下に元ファイル名で配置
-    if dest_path.is_dir():
+    if collision_mode != "error" and dest_path.is_dir():
         dest_path = dest_path / src_path.name
 
     # 親ディレクトリの自動作成
@@ -140,7 +142,32 @@ def copy_or_move(
             raise FileExistsError(f"コピー先がすでに存在します: {dest_path}")
         dest_path = ensure_unique_destination(dest_path)
 
-    # 実行
+    # Reserve/publish atomically, including a competitor arriving after the
+    # existence check above. Never let shutil overwrite in this mode.
+    if not overwrite:
+        while True:
+            try:
+                if mode == "copy":
+                    return copy_noreplace(src_path, dest_path)
+                if mode != "move":
+                    raise ValueError(f"無効なモードです: {mode}")
+                try:
+                    rename_noreplace(src_path, dest_path)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    copy_noreplace(src_path, dest_path)
+                    if src_path.is_symlink() or src_path.is_file():
+                        src_path.unlink()
+                    else:
+                        shutil.rmtree(src_path)
+                return dest_path
+            except FileExistsError:
+                if collision_mode == "error":
+                    raise
+                dest_path = ensure_unique_destination(dest_path)
+
+    # Explicit overwrite remains a separate caller-selected operation.
     if mode == "move":
         if src_path.is_symlink():
             # ``shutil.move`` may dereference a directory symlink on a

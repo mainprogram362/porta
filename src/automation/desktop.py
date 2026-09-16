@@ -10,7 +10,7 @@ import shutil
 import sys
 
 from foundation.path import PathLike, normalize_path
-from foundation.process import run_command
+from runtime.process import run_command
 
 
 def _require_linux_desktop() -> None:

@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtWidgets import QDialogButtonBox, QLabel, QMessageBox, QTextEdit, QWidget
+from PySide6.QtWidgets import QDialogButtonBox, QLabel, QMessageBox, QWidget
 
-from foundation.user_space import configured_paths
-from gui import AppHeader, AppPageLayout
-from gui.persistent_settings import create_app_settings_file, show_settings_location_editor
+from settings.user_space import configured_paths
+from gui import AppHeader, AppPageLayout, JsonFieldSpec, JsonSettingsEditor
 
 from . import settings
 
@@ -17,7 +16,6 @@ class LocalAiSettingsScreen(QWidget):
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
-        self.setMinimumSize(640, 390)
         layout = AppPageLayout(self)
         header = AppHeader(return_to_main, title="ローカルAI設定")
         header.content_layout.addStretch(1)
@@ -40,36 +38,47 @@ class LocalAiSettingsScreen(QWidget):
         status = QLabel()
         status.setWordWrap(True)
         layout.addWidget(status)
-        editor = QTextEdit()
+        editor = JsonSettingsEditor(
+            validate=settings.validate_text,
+            path_keys={"runner_path", "model_path"},
+            fields={
+                "runner_path": JsonFieldSpec("AI実行プログラム", "llama.cppの llama-server など、実際に起動するファイルです。"),
+                "model_path": JsonFieldSpec("AIモデル", "使用するGGUFモデルファイルです。"),
+            },
+        )
         editor.setPlainText(settings.editable_text())
+        self._work_editor = editor
+        self._work_baseline = editor.toPlainText()
+        editor.set_source_state(*settings.settings_status())
         layout.addWidget(editor, 1)
         buttons = QDialogButtonBox()
         template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
-        location = buttons.addButton("保存先入口", QDialogButtonBox.ButtonRole.ActionRole)
-        create = buttons.addButton("設定を作成", QDialogButtonBox.ButtonRole.ActionRole)
+        editor.bind_edit_button(template)
         save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+        editor.bind_save_button(save)
         template.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
-        location.clicked.connect(lambda: show_settings_location_editor(self))
-        create.clicked.connect(lambda: self._create_settings(status))
         save.clicked.connect(lambda: self._save_settings(editor, status))
         layout.addWidget(buttons)
         self._refresh_status(status)
+
+    def describe_work_state(self):
+        if self._work_editor.toPlainText() != self._work_baseline:
+            return {"level": 3, "reason": "設定の編集内容があります。保存状況を確認してください。"}
+        return {"level": 1, "reason": "読み込んだ設定を表示しています。"}
 
     def _refresh_status(self, label: QLabel) -> None:
         state, detail = settings.settings_status()
         configured = settings.load_settings()
         ready = bool(configured["runner_path"] and configured["model_path"])
-        label.setText(f"設定状態: {state} — {detail}\nAIファイル指定: {'完了' if ready else '未設定'}")
+        label.setText(
+            f"設定状態: {state} — {detail}\nAIファイル指定: {'完了' if ready else '未設定'}"
+            "\n保存先の作成・変更はメインメニューの「設定」から行います。"
+        )
 
-    def _create_settings(self, status: QLabel) -> None:
-        try:
-            create_app_settings_file(self, settings.create_settings_file)
-        finally:
-            self._refresh_status(status)
-
-    def _save_settings(self, editor: QTextEdit, status: QLabel) -> None:
+    def _save_settings(self, editor: JsonSettingsEditor, status: QLabel) -> None:
         try:
             settings.save_text(editor.toPlainText())
+            self._work_baseline = editor.toPlainText()
         except ValueError as exc:
             QMessageBox.warning(self, "設定を保存できません", str(exc))
             return

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime.runtime_activity import runtime_activity
+
 import os
 from pathlib import Path
 import shutil
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from foundation.path import path_entry_exists
 from gui import PathLineInput
+from gui.layout_policy import set_text_rows
 
 from .copy_workflow import CopyPlan, build_copy_preview
 
@@ -74,6 +77,7 @@ class CooperativeCopyThread(QThread):
             self._cancel_requested = True
             self._condition.notify_all()
 
+    @runtime_activity('ファイルコピー中')
     def run(self) -> None:
         try:
             self._validate_plan()
@@ -246,7 +250,6 @@ class QuickCopyDialog(QDialog):
     def __init__(self, sources: tuple[Path, ...], destination_text: str = "") -> None:
         super().__init__(None)
         self.setWindowTitle(f"実体コピー（{len(sources)}件）")
-        self.setMinimumSize(720, 620)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._sources = sources
         self._plan: CopyPlan | None = None
@@ -265,7 +268,7 @@ class QuickCopyDialog(QDialog):
         layout.addWidget(QLabel(f"コピー対象（{len(sources)}件）"))
         self.sources_text = QTextEdit()
         self.sources_text.setReadOnly(True)
-        self.sources_text.setMaximumHeight(120)
+        set_text_rows(self.sources_text, minimum=2, maximum=5)
         self.sources_text.setPlainText("\n".join(str(path) for path in sources))
         layout.addWidget(self.sources_text)
 

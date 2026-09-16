@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from foundation.shared_launchers import LauncherLocations
-from gui import AppHeader, AppPageLayout
+from apps.system_tools.external_app_launcher.locations import LauncherLocations
+from gui import AppHeader, AppPageLayout, JsonFieldSpec, JsonSettingsEditor
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -45,8 +44,10 @@ class ConfiguredProgramLauncherScreen(QWidget):
         editable_text: Callable[[], str],
         template_text: Callable[[], str],
         save_text: Callable[[str], object],
+        validate_text: Callable[[str], object] | None = None,
     ) -> None:
         super().__init__()
+        self._return_to_main = return_to_main
         self._title = title
         self._settings_title = settings_title
         self._settings_warning = settings_warning
@@ -54,12 +55,12 @@ class ConfiguredProgramLauncherScreen(QWidget):
         self._editable_text = editable_text
         self._template_text = template_text
         self._save_text = save_text
+        self._validate_text = validate_text
         self._settings_dialog: QDialog | None = None
-        self._settings_editor: QTextEdit | None = None
+        self._settings_editor: JsonSettingsEditor | None = None
 
         layout = AppPageLayout(self)
-        header = AppHeader(return_to_main, title=title, on_settings=self.show_settings)
-        header.content_layout.addStretch(1)
+        header = AppHeader(self._return_to_main, title=title, on_settings=self.show_settings)
         reload_button = QPushButton("再読み込み")
         reload_button.clicked.connect(self.reload_programs)
         header.content_layout.addWidget(reload_button)
@@ -87,6 +88,9 @@ class ConfiguredProgramLauncherScreen(QWidget):
         box_layout.addWidget(scroll)
         layout.addWidget(box, 1)
         self.reload_programs()
+
+    def describe_work_state(self):
+        return {"level": 1, "reason": "外部プログラムを選ぶ画面です。起動済みの外部アプリとは別です。"}
 
     def reload_programs(self) -> None:
         while self._programs_layout.count():
@@ -127,7 +131,6 @@ class ConfiguredProgramLauncherScreen(QWidget):
             panel_layout.addWidget(detail)
             for application in scan.applications:
                 button = QPushButton(application.name)
-                button.setMinimumHeight(28)
                 button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
                 button.setToolTip(f"起動: {application.launcher_path}")
                 button.clicked.connect(
@@ -155,16 +158,26 @@ class ConfiguredProgramLauncherScreen(QWidget):
         if self._settings_dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle(self._settings_title)
-            dialog.setMinimumSize(720, 420)
             layout = QVBoxLayout(dialog)
             warning = QLabel(self._settings_warning)
             warning.setWordWrap(True)
             layout.addWidget(warning)
-            editor = QTextEdit()
+            editor = JsonSettingsEditor(
+                validate=self._validate_text,
+                path_keys={"locations"},
+                fields={
+                    "locations": JsonFieldSpec(
+                        "外部プログラムの置き場",
+                        "各場所の直下から start.sh を持つプログラム用フォルダを探します。",
+                    )
+                },
+            )
             layout.addWidget(editor, 1)
             buttons = QDialogButtonBox()
             template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
+            editor.bind_edit_button(template)
             save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+            editor.bind_save_button(save)
             close = buttons.addButton(QDialogButtonBox.StandardButton.Close)
             template.clicked.connect(lambda: editor.setPlainText(self._template_text()))
             save.clicked.connect(self.save_settings)
@@ -174,6 +187,8 @@ class ConfiguredProgramLauncherScreen(QWidget):
             self._settings_editor = editor
         assert self._settings_editor is not None
         self._settings_editor.setPlainText(self._editable_text())
+        loaded = self._load_locations()
+        self._settings_editor.set_source_state(loaded.state, loaded.detail)
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()

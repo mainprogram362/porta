@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from html import escape
+from pathlib import Path
 import re
 
 from PySide6.QtCore import QTimer, Qt, QUrl
 from PySide6.QtGui import QCursor, QPalette
 from PySide6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QTextBrowser,
     QToolTip,
@@ -21,7 +24,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui import AppHeader, AppPageLayout, NoWheelComboBox, add_path_list_input
+from foundation.path_expansion import direct_children_for_selected_folders
+from gui import (
+    AppHeader,
+    AppPageLayout,
+    JsonFieldSpec,
+    JsonSettingsEditor,
+    NoWheelComboBox,
+    add_path_list_input,
+)
+from gui.path_list_context import add_favorite_paths_menu, add_path_expansion_menu
+from gui.flow_layout import FlowLayout
+from gui.layout_policy import preferred_window_size
 from media import (
     TextSearchHit,
     TextThreadDocument,
@@ -32,6 +46,8 @@ from media import (
     load_shitaraba_saved_texts,
     reply_descendant_tree,
 )
+
+from . import settings
 
 
 _REFERENCE = re.compile(r">>\s*(?P<number>\d+)(?:\s*-\s*\d+)?")
@@ -85,9 +101,15 @@ def _reference_preview(document: TextThreadDocument, link: str | QUrl) -> str:
 class TextThreadViewerScreen(QWidget):
     """View only explicitly loaded response text; never edit or persist it."""
 
+    def describe_work_state(self):
+        if self._documents or self._search_hits:
+            return {"level": 3, "reason": f"読み込んだスレッド{len(self._documents)}件・閲覧位置・検索結果を保持しています。"}
+        return {"level": 2, "reason": "閲覧対象と検索条件を指定する段階です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
+        self._settings = settings.load_settings()
         self._documents: tuple[TextThreadDocument, ...] = ()
         self._current_document_index = 0
         self._current_reply_number: int | None = None
@@ -101,7 +123,11 @@ class TextThreadViewerScreen(QWidget):
     def _build_ui(self) -> None:
         layout = AppPageLayout(self)
 
-        self.setup_widget = AppHeader(self._return_to_main, title="テキストスレッド")
+        self.setup_widget = AppHeader(
+            self._return_to_main,
+            title="テキストスレッド",
+            on_settings=self.show_settings,
+        )
         setup_row = self.setup_widget.content_layout
         setup_row.addStretch(1)
         setup_row.addWidget(QLabel("読み取りモード"))
@@ -111,25 +137,39 @@ class TextThreadViewerScreen(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         setup_row.addWidget(self.mode_combo)
         layout.addWidget(self.setup_widget)
-        self.status_label = QLabel("テキストを追加して「読み込む」を押してください。読み込み内容は今回だけ保持します。")
+        self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_label.setVisible(False)
         layout.addWidget(self.status_label)
 
         workspace = QHBoxLayout()
-        source_box = QGroupBox("読み込むテキスト")
+        source_box = QGroupBox()
         self.source_box = source_box
         source_layout = QVBoxLayout(source_box)
         self.source_input = add_path_list_input(
             source_layout,
-            rows=12,
+            rows=4,
             placeholder="保存した .txt を追加またはドロップします。複数追加できます。",
             accepted_path_kind="all",
             show_controls=False,
             path_column_label="テキストパス",
+            double_click_directory_selection=True,
+            double_click_directory_replaces_all=True,
+            enable_row_selection=True,
+            direct_child_filter=self._accept_source_child,
         )
         self.source_input.textChanged.connect(self._source_paths_changed)
-        source_actions = QHBoxLayout()
+        self.source_input.actionPerformed.connect(self._show_status)
+        self.source_input.set_context_menu_augmenter(self._add_source_context_actions)
+        self.source_input.setPlainText(
+            "\n".join(
+                entry["path"]
+                for entry in self._settings["favorite_paths"]
+                if entry["initial_input"]
+            )
+        )
+        source_actions = FlowLayout()
         clear_sources = QPushButton("一覧を空にする")
         clear_sources.clicked.connect(self.source_input.clear_items)
         source_actions.addWidget(clear_sources)
@@ -160,8 +200,8 @@ class TextThreadViewerScreen(QWidget):
         thread_row.addWidget(next_thread)
         self.thread_info_label = QLabel("未読込")
         thread_row.addWidget(self.thread_info_label)
-        self.expand_viewer_button = QPushButton("閲覧を広げる")
-        self.expand_viewer_button.setToolTip("入力一覧などを隠し、閲覧と検索だけを広く表示します。")
+        self.expand_viewer_button = QPushButton("読み込み欄を隠す")
+        self.expand_viewer_button.setToolTip("読み込み済みの内容は保ったまま、テキストパス一覧を開閉します。")
         self.expand_viewer_button.clicked.connect(self._toggle_expanded_viewer)
         thread_row.addWidget(self.expand_viewer_button)
         viewer_layout.addLayout(thread_row)
@@ -169,7 +209,13 @@ class TextThreadViewerScreen(QWidget):
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel("検索"))
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("読み込み済みの全スレッドを検索")
+        self.search_input.setPlaceholderText("例: 猫 犬　/　猫 OR 犬　/　猫 -犬")
+        self.search_input.setToolTip(
+            "空白または AND: すべて含む\n"
+            "OR または |: どれかを含む\n"
+            "-単語: その単語を含むレスを除外\n"
+            '"空白を含む語句": ひとまとまりとして検索'
+        )
         self.search_input.textChanged.connect(self._search_changed)
         search_row.addWidget(self.search_input, 1)
         previous_hit = QPushButton("前のヒット")
@@ -185,6 +231,11 @@ class TextThreadViewerScreen(QWidget):
         self.search_info_label = QLabel("検索語を入力")
         search_row.addWidget(self.search_info_label)
         viewer_layout.addLayout(search_row)
+        search_help = QLabel('空白/AND＝すべて含む　OR/|＝どれかを含む　-単語＝除外　"語句"＝ひとまとまり')
+        search_help.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
+        search_help.setToolTip(self.search_input.toolTip())
+        search_help.setWordWrap(True)
+        viewer_layout.addWidget(search_help)
 
         self.reply_browser = QTextBrowser()
         self.reply_browser.setOpenLinks(False)
@@ -195,6 +246,162 @@ class TextThreadViewerScreen(QWidget):
         viewer_layout.addWidget(self.reply_browser, 1)
         workspace.addWidget(viewer_box, 2)
         layout.addLayout(workspace, 1)
+
+    @staticmethod
+    def _accept_source_child(path) -> bool:  # type: ignore[no-untyped-def]
+        """Show navigable folders and loadable text files during expansion."""
+        return path.is_dir() or path.suffix.casefold() == ".txt"
+
+    def _add_source_context_actions(self, menu, item) -> None:  # type: ignore[no-untyped-def]
+        """Reuse the file-manager expansion menu and append viewer favorites."""
+        if menu.actions():
+            menu.addSeparator()
+        add_path_expansion_menu(
+            menu,
+            request_expand=lambda scope, with_query: self._expand_source_directories(
+                scope=scope, with_query=with_query
+            ),
+            open_one_directory=(
+                (lambda: self.source_input.open_directory_item(item)) if item is not None else None
+            ),
+            choose_one_directory=(
+                (lambda: self.source_input.choose_direct_children_for_item(item))
+                if item is not None
+                else None
+            ),
+        )
+        add_favorite_paths_menu(
+            menu,
+            [entry["path"] for entry in self._settings["favorite_paths"]],
+            choose_path=self._add_favorite_path,
+            title="お気に入りパスを追加",
+        )
+
+    def _add_favorite_path(self, value: str) -> None:
+        count = self.source_input.add_external_paths([Path(value)], replace=False)
+        self._show_status(f"お気に入りパスから{count}件を追加しました。")
+
+    def _expand_source_directories(self, *, scope: str, with_query: bool) -> None:
+        """Expand checked or blue-selected folders exactly like the file manager."""
+        if scope == "checked":
+            source_paths = self.source_input.selected_paths(deduplicate=True)
+            scope_label = "チェック済み"
+        elif scope == "selected":
+            source_paths = self.source_input.row_selected_paths(deduplicate=True)
+            scope_label = "選択中"
+        else:
+            raise ValueError(f"未対応の展開範囲です: {scope}")
+
+        query = ""
+        mode = "contains"
+        item_kind = "all"
+        if with_query:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("条件を指定して直下項目へ展開")
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel("範囲: 直下のみ（フォルダと .txt が対象）"))
+            query_input = QLineEdit()
+            query_input.setPlaceholderText("検索語（, で複数・-語で除外）")
+            layout.addWidget(query_input)
+            conditions = QHBoxLayout()
+            conditions.addWidget(QLabel("方法"))
+            mode_combo = NoWheelComboBox()
+            mode_combo.addItem("部分一致", "contains")
+            mode_combo.addItem("正規表現", "regex")
+            conditions.addWidget(mode_combo)
+            conditions.addWidget(QLabel("種別"))
+            kind_combo = NoWheelComboBox()
+            kind_combo.addItem("すべて", "all")
+            kind_combo.addItem("ファイル", "file")
+            kind_combo.addItem("フォルダ", "directory")
+            conditions.addWidget(kind_combo)
+            layout.addLayout(conditions)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+            )
+            ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            if ok is not None:
+                ok.setText("展開")
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            query = query_input.text()
+            mode = mode_combo.currentData()
+            item_kind = kind_combo.currentData()
+        try:
+            children, folder_count = direct_children_for_selected_folders(
+                source_paths,
+                query,
+                mode=mode,
+                item_kind=item_kind,
+            )
+            children = tuple(path for path in children if self._accept_source_child(path))
+        except (OSError, ValueError) as exc:
+            self._show_status(f"展開していません: {exc}")
+            QMessageBox.warning(self, "展開できません", str(exc))
+            return
+        if scope == "checked":
+            self.source_input.replace_checked_items(str(path) for path in children)
+        else:
+            self.source_input.replace_row_selected_items(str(path) for path in children)
+        condition = f"・条件「{query}」" if with_query and query.strip() else ""
+        self._show_status(
+            f"{scope_label}{len(source_paths)}件を置換・{folder_count}フォルダを展開・"
+            f"{len(children)}件を追加{condition}"
+        )
+
+    def show_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("テキストスレッドビューアの永続設定")
+        dialog.resize(preferred_window_size(dialog))
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(
+            QLabel(
+                "登録したパスは、読み込み欄の右クリックに「お気に入りパス」として表示します。"
+                "initial_input を有効にした場所だけは、ビューアを開いた時点で一覧へ入ります。"
+            )
+        )
+        editor = JsonSettingsEditor(
+            validate=settings.validate_text,
+            path_keys={"path"},
+            fields={
+                "favorite_paths": JsonFieldSpec(
+                    "お気に入りパス",
+                    "フォルダまたは .txt を登録できます。空欄の項目は使用されません。",
+                    item_template={"path": "", "initial_input": False},
+                ),
+                "path": JsonFieldSpec("パス"),
+                "initial_input": JsonFieldSpec(
+                    "起動時に一覧へ入れる",
+                    "無効でも右クリックのお気に入りには表示されます。",
+                ),
+            },
+        )
+        editor.setPlainText(settings.editable_text())
+        editor.set_source_state(*settings.settings_status())
+        layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox()
+        template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
+        editor.bind_edit_button(template)
+        save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+        editor.bind_save_button(save)
+        close = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
+        template.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
+
+        def save_settings() -> None:
+            try:
+                self._settings = settings.save_text(editor.toPlainText())
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(dialog, "設定を保存できません", str(exc))
+                return
+            dialog.accept()
+
+        save.clicked.connect(save_settings)
+        close.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _mode_changed(self) -> None:
         self._clear_loaded_documents("読み取りモードを変更しました。テキストを読み込み直してください。")
@@ -217,7 +424,7 @@ class TextThreadViewerScreen(QWidget):
         self.thread_info_label.setText("未読込")
         self.search_info_label.setText("検索語を入力")
         self.reply_browser.clear()
-        self.status_label.setText(message)
+        self._show_status(message)
 
     def load_texts(self) -> None:
         if self.mode_combo.currentData() != "shitaraba_text":
@@ -239,12 +446,13 @@ class TextThreadViewerScreen(QWidget):
         self._search_changed(self.search_input.text())
         if self._documents:
             self._render_current_document()
+            self._set_source_visible(False)
         else:
             self.reply_browser.clear()
-        details = [f"{len(self._documents)} スレッドを読み込みました。"]
         if result.errors:
-            details.extend(result.errors)
-        self.status_label.setText("\n".join(details))
+            self._show_status("\n".join(result.errors))
+        else:
+            self._hide_status()
 
     def _thread_changed(self, index: int) -> None:
         if index < 0 or index >= len(self._documents):
@@ -257,7 +465,7 @@ class TextThreadViewerScreen(QWidget):
 
     def _move_document(self, amount: int) -> None:
         if not self._documents:
-            self.status_label.setText("先にテキストを読み込んでください。")
+            self._show_status("先にテキストを読み込んでください。")
             return
         index = (self._current_document_index + amount) % len(self._documents)
         self._search_hit_index = -1
@@ -265,22 +473,31 @@ class TextThreadViewerScreen(QWidget):
         self._update_search_info()
 
     def _toggle_expanded_viewer(self) -> None:
-        """Temporarily devote the whole screen to the read-only viewer."""
-        self._viewer_is_expanded = not self._viewer_is_expanded
-        self.setup_widget.setVisible(not self._viewer_is_expanded)
-        self.status_label.setVisible(not self._viewer_is_expanded)
-        self.source_box.setVisible(not self._viewer_is_expanded)
+        """Open or close the source list without affecting loaded documents."""
+        self._set_source_visible(self._viewer_is_expanded)
+
+    def _set_source_visible(self, visible: bool) -> None:
+        self._viewer_is_expanded = not visible
+        self.source_box.setVisible(visible)
         self.expand_viewer_button.setText(
-            "通常表示に戻す" if self._viewer_is_expanded else "閲覧を広げる"
+            "読み込み欄を表示" if self._viewer_is_expanded else "読み込み欄を隠す"
         )
+
+    def _show_status(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.status_label.setVisible(bool(message))
+
+    def _hide_status(self) -> None:
+        self.status_label.clear()
+        self.status_label.setVisible(False)
 
     def _open_search_results_window(self) -> None:
         query = self.search_input.text().strip()
         if not query:
-            self.status_label.setText("検索語を入力してから、ヒット一覧を開いてください。")
+            self._show_status("検索語を入力してから、ヒット一覧を開いてください。")
             return
         if not self._documents:
-            self.status_label.setText("先にテキストを読み込んでください。")
+            self._show_status("先にテキストを読み込んでください。")
             return
         window = TextThreadSearchResultsWindow(self._documents, query, parent=self)
         window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -334,7 +551,7 @@ class TextThreadViewerScreen(QWidget):
 
     def _move_search_hit(self, amount: int) -> None:
         if not self._search_hits:
-            self.status_label.setText("検索ヒットがありません。")
+            self._show_status("検索ヒットがありません。")
             return
         if self._search_hit_index < 0:
             self._search_hit_index = self._first_hit_in_current_document(amount)
@@ -388,7 +605,12 @@ class TextThreadViewerScreen(QWidget):
         self.thread_combo.blockSignals(False)
         self._render_current_document()
         if reply_number is not None:
-            QTimer.singleShot(0, lambda: self.reply_browser.scrollToAnchor(f"reply-{reply_number}"))
+            browser = self.reply_browser
+            QTimer.singleShot(
+                0,
+                browser,
+                lambda: browser.scrollToAnchor(f"reply-{reply_number}"),
+            )
 
     def _browser_link_clicked(self, url: QUrl) -> None:
         number_text = url.path().lstrip("/") or url.host()
@@ -409,9 +631,11 @@ class TextThreadViewerScreen(QWidget):
             self._render_current_document()
             # 開閉では親レスへスクロールし直さない。表示中の位置のまま、
             # その直下だけを広げるための復元である。
+            browser = self.reply_browser
             QTimer.singleShot(
                 0,
-                lambda: self.reply_browser.verticalScrollBar().setValue(scroll_position),
+                browser,
+                lambda: browser.verticalScrollBar().setValue(scroll_position),
             )
 
     def _reference_hovered(self, link: str | QUrl) -> None:
@@ -551,7 +775,7 @@ class TextThreadSearchResultsWindow(QDialog):
             for document_index in range(len(documents))
         )
         self.setWindowTitle("検索ヒット一覧")
-        self.resize(860, 620)
+        self.resize(preferred_window_size(self))
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -621,7 +845,12 @@ class TextThreadSearchResultsWindow(QDialog):
         else:
             self._expanded_replies.add(key)
         self._render_selected_document(self._current_document_index)
-        QTimer.singleShot(0, lambda: self.browser.verticalScrollBar().setValue(scroll_position))
+        browser = self.browser
+        QTimer.singleShot(
+            0,
+            browser,
+            lambda: browser.verticalScrollBar().setValue(scroll_position),
+        )
 
     def _reference_hovered(self, link: str | QUrl) -> None:
         preview = _reference_preview(self._documents[self._current_document_index], link)

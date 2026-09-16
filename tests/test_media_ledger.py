@@ -231,7 +231,7 @@ def test_parts_common_editor_uses_standard_types_presets_and_existing_custom_key
         ]
         screen._refresh_common_part_field_choices()
 
-        assert screen.minimumWidth() >= 1080
+        assert screen.minimumWidth() <= 800
         assert screen.common_part_field_combo.findData("source.uploader") >= 0
         assert screen.common_part_field_combo.findData("group.name") >= 0
 

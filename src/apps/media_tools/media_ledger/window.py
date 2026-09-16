@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from gui.current_page_stack import CurrentPageStack
+
 import json
 from collections.abc import Callable
 
@@ -17,7 +19,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui import AppHeader, AppPageLayout, PathLineInput, PathListInput
+from gui.flow_layout import FlowLayout
 from media.catalog import CatalogAttribute
 from media.file_attributes import (
     STANDARD_CATALOG_FIELDS,
@@ -97,6 +99,11 @@ def _attribute_meaning(key: str) -> str:
 class MediaLedgerScreen(QWidget):
     """Main-ledger workbench; ID-free part editing lives in Media Information."""
 
+    def describe_work_state(self):
+        if self._ledger is not None or self._parts or self._pending_parts or self._review_patch is not None:
+            return {"level": 3, "reason": f"本台帳・パーツ{len(self._parts)}件を保持しています。保存状況を確認してください。"}
+        return {"level": 2, "reason": "本台帳・パーツの指定と設定の段階です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
@@ -109,10 +116,6 @@ class MediaLedgerScreen(QWidget):
         self._pending_parts: tuple[MediaPart, ...] = ()
         self._ledger: MediaLedger | None = None
         self._selected_work_id: str | None = None
-        # The side-by-side item editor contains two independent edit scopes.
-        # Keep both fully visible at the launcher minimum instead of clipping
-        # controls below the fold on a 680px-tall window.
-        self.setMinimumSize(1080, 780)
         self._build_ui()
         self._refresh_parts()
         self._refresh_ledger()
@@ -128,7 +131,7 @@ class MediaLedgerScreen(QWidget):
             )
         )
 
-        self.stack = QStackedWidget()
+        self.stack = CurrentPageStack()
         # Keep the former page instantiated during this migration so older
         # in-memory callers remain valid, but do not expose two competing
         # editing destinations in the normal UI.  New parts enter below as a
@@ -163,19 +166,19 @@ class MediaLedgerScreen(QWidget):
         workspace = QHBoxLayout()
         workspace.setSpacing(8)
         list_box = QGroupBox("パーツ一覧（IDなし）")
-        list_box.setMinimumWidth(250)
         list_layout = QVBoxLayout(list_box)
         self.part_tree = QTreeWidget()
         self.part_tree.setHeaderLabels(["候補", "タイトル", "ファイル名"])
         self.part_tree.setRootIsDecorated(False)
         self.part_tree.setAlternatingRowColors(True)
-        self.part_tree.setColumnWidth(0, 52)
+        self.part_tree.header().setSectionResizeMode(
+            0, self.part_tree.header().ResizeMode.ResizeToContents
+        )
         self.part_tree.itemSelectionChanged.connect(self._part_selected)
         list_layout.addWidget(self.part_tree, 1)
         workspace.addWidget(list_box, 2)
 
         editor_box = QGroupBox("パーツ編集")
-        editor_box.setMinimumWidth(760)
         editor_layout = QHBoxLayout(editor_box)
         editor_layout.setSpacing(8)
 
@@ -188,28 +191,23 @@ class MediaLedgerScreen(QWidget):
         self.part_attribute_tree.setRootIsDecorated(False)
         self.part_attribute_tree.setAlternatingRowColors(True)
         self.part_attribute_tree.itemSelectionChanged.connect(self._part_attribute_selected)
-        self.part_attribute_tree.setMinimumWidth(390)
         individual_column.addWidget(self.part_attribute_tree, 1)
 
         individual_box = QGroupBox("選択中の候補だけ")
         individual_layout = QVBoxLayout(individual_box)
         edit_form = QFormLayout()
         self.part_key_input = QLineEdit()
-        self.part_key_input.setMinimumWidth(270)
         self.part_key_input.setPlaceholderText("例: classification.tag / custom.note")
         self.part_value_input = QLineEdit()
-        self.part_value_input.setMinimumWidth(270)
         self.part_value_input.setPlaceholderText("文字列として上書きします。空欄なら項目を消します。")
         edit_form.addRow("項目", self.part_key_input)
         edit_form.addRow("値", self.part_value_input)
         individual_layout.addLayout(edit_form)
-        edit_actions = QHBoxLayout()
+        edit_actions = FlowLayout()
         replace_button = QPushButton("項目を上書き")
-        replace_button.setMinimumWidth(128)
         replace_button.clicked.connect(self.replace_part_attribute)
         edit_actions.addWidget(replace_button)
         remove_button = QPushButton("項目を削除")
-        remove_button.setMinimumWidth(108)
         remove_button.clicked.connect(self.remove_part_attribute)
         edit_actions.addWidget(remove_button)
         individual_layout.addLayout(edit_actions)
@@ -217,7 +215,6 @@ class MediaLedgerScreen(QWidget):
         editor_layout.addLayout(individual_column, 3)
 
         common_box = QGroupBox("全候補への共通操作")
-        common_box.setMinimumWidth(350)
         common_layout = QVBoxLayout(common_box)
         common_hint = QLabel("上書きは項目がなければ追加、あれば同じ値へ更新します。元JSONは保存するまで変わりません。")
         common_hint.setWordWrap(True)
@@ -226,7 +223,6 @@ class MediaLedgerScreen(QWidget):
         common_kind_row = QHBoxLayout()
         common_kind_row.addWidget(QLabel("項目の種類"))
         self.common_part_scope_combo = QComboBox()
-        self.common_part_scope_combo.setMinimumWidth(190)
         self.common_part_scope_combo.addItem("標準項目", "standard")
         self.common_part_scope_combo.addItem("一覧にある独自項目", "existing")
         self.common_part_scope_combo.addItem("完全自由項目", "custom")
@@ -237,11 +233,9 @@ class MediaLedgerScreen(QWidget):
         common_key_row = QHBoxLayout()
         common_key_row.addWidget(QLabel("項目"))
         self.common_part_field_combo = QComboBox()
-        self.common_part_field_combo.setMinimumWidth(260)
         self.common_part_field_combo.currentIndexChanged.connect(self._update_common_part_controls)
         common_key_row.addWidget(self.common_part_field_combo, 1)
         self.common_part_custom_key_input = QLineEdit()
-        self.common_part_custom_key_input.setMinimumWidth(260)
         self.common_part_custom_key_input.setPlaceholderText("例: custom.note")
         self.common_part_custom_key_input.textChanged.connect(self._update_common_part_controls)
         common_key_row.addWidget(self.common_part_custom_key_input, 1)
@@ -250,11 +244,9 @@ class MediaLedgerScreen(QWidget):
         common_value_row = QHBoxLayout()
         common_value_row.addWidget(QLabel("値"))
         self.common_part_preset_combo = QComboBox()
-        self.common_part_preset_combo.setMinimumWidth(180)
         self.common_part_preset_combo.currentIndexChanged.connect(self._update_common_part_controls)
         common_value_row.addWidget(self.common_part_preset_combo)
         self.common_part_value_input = QLineEdit()
-        self.common_part_value_input.setMinimumWidth(220)
         self.common_part_value_input.setPlaceholderText("全候補に設定する値")
         self.common_part_value_input.textChanged.connect(self._update_common_part_controls)
         common_value_row.addWidget(self.common_part_value_input, 1)
@@ -262,13 +254,11 @@ class MediaLedgerScreen(QWidget):
         self.common_part_help_label = QLabel()
         self.common_part_help_label.setWordWrap(True)
         common_layout.addWidget(self.common_part_help_label)
-        common_actions = QHBoxLayout()
+        common_actions = FlowLayout()
         self.common_replace_button = QPushButton("全候補に上書き")
-        self.common_replace_button.setMinimumWidth(138)
         self.common_replace_button.clicked.connect(self.replace_common_part_attribute)
         common_actions.addWidget(self.common_replace_button)
         self.common_remove_button = QPushButton("全候補から削除")
-        self.common_remove_button.setMinimumWidth(138)
         self.common_remove_button.clicked.connect(self.remove_common_part_attribute)
         common_actions.addWidget(self.common_remove_button)
         common_layout.addLayout(common_actions)
@@ -594,7 +584,7 @@ class MediaLedgerScreen(QWidget):
         elif field.value_type == "resolution":
             hint = "解像度は 1920×1080（* でも可）の形式で入力します。"
         elif field.value_type == "time_range":
-            hint = "見どころ時間は 13:23、または 13:11-14:25 の形式で入力します。"
+            hint = "見どころ時間は 13:23.417、または 13:11.250-14:25.900 の形式でも入力できます。"
         elif field.value_type in {"number", "duration_seconds"}:
             hint = "数値として入力します。評価は候補から選べます。"
         elif field.key == "classification.category_tree":
@@ -743,7 +733,6 @@ class MediaLedgerScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("評価・見どころパッチの照合詳細")
-        dialog.setMinimumSize(720, 360)
         layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)

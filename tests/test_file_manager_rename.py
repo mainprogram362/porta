@@ -106,6 +106,43 @@ def test_rename_rejects_an_existing_output_before_starting(tmp_path: Path):
     assert existing.read_text(encoding="utf-8") == "existing"
 
 
+def test_rename_reports_every_existing_name_collision(tmp_path: Path):
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    first_output = tmp_path / "first_done.txt"
+    second_output = tmp_path / "second_done.txt"
+    first_output.write_text("taken", encoding="utf-8")
+    second_output.mkdir()
+
+    preview = build_rename_preview(
+        f"{first}\n{second}", [RenameRule("append", text="_done")]
+    )
+
+    assert not preview.is_ready
+    for path in (first, second, first_output, second_output):
+        assert str(path) in preview.text
+    assert "すでに存在する項目との衝突" in preview.text
+
+
+def test_rename_reports_every_source_for_duplicate_planned_name(tmp_path: Path):
+    first = tmp_path / "ab.txt"
+    second = tmp_path / "ac.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+
+    preview = build_rename_preview(
+        f"{first}\n{second}", [RenameRule("remove_range", first=2, second=2)]
+    )
+
+    assert not preview.is_ready
+    assert "今回の変更後名どうしの重複" in preview.text
+    assert str(first) in preview.text
+    assert str(second) in preview.text
+    assert str(tmp_path / "a.txt") in preview.text
+
+
 def test_execute_rename_plan_changes_names_without_a_temporary_copy(tmp_path: Path):
     source = tmp_path / "movie.txt"
     source.write_text("content", encoding="utf-8")

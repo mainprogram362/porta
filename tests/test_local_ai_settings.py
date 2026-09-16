@@ -15,13 +15,10 @@ def test_local_ai_settings_are_optional_and_shared(tmp_path, monkeypatch):
     assert settings.load_settings() == saved
 
 
-def test_local_ai_settings_reject_unknown_and_relative_paths():
-    try:
-        settings.validate_text('{"runner_path": "bin/llama-server"}')
-    except ValueError as exc:
-        assert "runner_path" in str(exc)
-    else:
-        raise AssertionError("相対パスを受け入れてはいけません")
+def test_local_ai_settings_resolve_relative_paths_and_reject_unknown_keys():
+    from foundation.persistent_settings import resolve_config_path
+    value = settings.validate_text('{"runner_path": "bin/llama-server"}')
+    assert value["runner_path"] == resolve_config_path("bin/llama-server")
 
     try:
         settings.validate_text('{"other": "value"}')

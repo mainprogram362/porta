@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from gui import AppHeader, AppPageLayout
+from gui.layout_policy import set_text_rows
 
 from . import settings
 from .runtime import LocalAiSession
@@ -32,6 +33,17 @@ _CONTEXT_MESSAGE_LIMIT = 20
 
 class LocalAiChatScreen(QWidget):
     """A chat whose transcript and context disappear when this screen closes."""
+
+    def describe_work_state(self):
+        if self._load_timer.isActive():
+            return {"level": 4, "reason": "AIを読み込み中です。停止はこの画面で行ってください。"}
+        if self._request is not None and not self._request.done():
+            return {"level": 4, "reason": "AIの応答を待っています。停止はこの画面で行ってください。"}
+        if self._conversation or self._input.toPlainText() or self._transcript.toPlainText():
+            return {"level": 3, "reason": "会話または送信前の文章があります。閉じると失われます。"}
+        if self._session is not None:
+            return {"level": 2, "reason": "AIは読み込み済みです。閉じるとこの作業のAIを終了します。"}
+        return {"level": 1, "reason": "会話は未開始です。"}
 
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
@@ -49,7 +61,6 @@ class LocalAiChatScreen(QWidget):
         self._request_timer = QTimer(self)
         self._request_timer.setInterval(100)
         self._request_timer.timeout.connect(self._collect_response)
-        self.setMinimumSize(720, 560)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -68,7 +79,7 @@ class LocalAiChatScreen(QWidget):
         layout.addWidget(QLabel("実行状況（この画面を閉じると消去・ファイル保存なし）"))
         self._activity = QPlainTextEdit()
         self._activity.setReadOnly(True)
-        self._activity.setFixedHeight(150)
+        set_text_rows(self._activity, minimum=3, maximum=7)
         self._activity.setPlaceholderText("AIを読み込むと、使用するファイルと現在の処理をここに表示します。")
         layout.addWidget(self._activity)
         self._transcript = QPlainTextEdit()
@@ -76,7 +87,7 @@ class LocalAiChatScreen(QWidget):
         self._transcript.setPlaceholderText("AIを読み込むと、ここに今回だけの会話を表示します。")
         layout.addWidget(self._transcript, 1)
         self._input = QPlainTextEdit()
-        self._input.setFixedHeight(88)
+        set_text_rows(self._input, minimum=3, maximum=8)
         self._input.setPlaceholderText("メッセージを入力")
         layout.addWidget(self._input)
         actions = QHBoxLayout()

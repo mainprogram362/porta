@@ -2,36 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtWidgets import QMenu, QTreeWidgetItem
+from gui.path_list_context import add_favorite_paths_menu, add_path_expansion_menu
 
 
-def add_registered_paths_menu(
-    menu: QMenu,
-    paths: list[str],
-    *,
-    choose_path: Callable[[str], None],
-    title: str = "登録パスを追加",
-) -> None:
-    """Append an explicit local-path chooser only when usable entries exist."""
-    if not paths:
-        return
-    if menu.actions():
-        menu.addSeparator()
-    # Keep an explicit Qt parent.  Context menus are built on demand and a
-    # submenu created only from a Python return value can otherwise vanish
-    # before its action is triggered.
-    registered_menu = QMenu(title, menu)
-    menu.addMenu(registered_menu)
-    registered_menu.setToolTipsVisible(True)
-    for path_text in paths:
-        action = registered_menu.addAction(path_text)
-        action.setToolTip(path_text)
-        action.triggered.connect(
-            lambda _checked=False, value=path_text: choose_path(value)
-        )
+# Compatibility name retained for existing file-manager callers.
+add_registered_paths_menu = add_favorite_paths_menu
 
 
 def add_file_manager_path_actions(
@@ -51,6 +29,13 @@ def add_file_manager_path_actions(
     copy_checked_file_names: Callable[[], None] | None = None,
     copy_selected_file_names: Callable[[], None] | None = None,
     copy_all_file_names: Callable[[], None] | None = None,
+    show_one_tree: Callable[[Path], None] | None = None,
+    show_checked_trees: Callable[[], None] | None = None,
+    show_selected_trees: Callable[[], None] | None = None,
+    show_all_trees: Callable[[], None] | None = None,
+    checked_tree_directory_count: int = 0,
+    selected_tree_directory_count: int = 0,
+    all_tree_directory_count: int = 0,
     copy_one_real_item: Callable[[Path], None] | None = None,
     copy_checked_real_items: Callable[[], None] | None = None,
     copy_selected_real_items: Callable[[], None] | None = None,
@@ -85,8 +70,8 @@ def add_file_manager_path_actions(
     ):
         real_actions = QMenu("実体操作", menu)
         menu.addMenu(real_actions)
-        if copy_one_real_item is not None and item is not None and item.text(1).strip():
-            selected_path = Path(item.text(1).strip())
+        if copy_one_real_item is not None and item is not None and item.text(1):
+            selected_path = Path(item.text(1))
             display_name = selected_path.name or str(selected_path)
             one_action = real_actions.addAction(f"この1件のみをコピー（{display_name}）…")
             one_action.setToolTip(f"この項目の実体だけをコピーします: {selected_path}")
@@ -109,8 +94,8 @@ def add_file_manager_path_actions(
             selected_action.triggered.connect(copy_selected_real_items)
         if compress_one_real_item is not None or compress_checked_real_items is not None:
             real_actions.addSeparator()
-        if compress_one_real_item is not None and item is not None and item.text(1).strip():
-            compression_path = Path(item.text(1).strip())
+        if compress_one_real_item is not None and item is not None and item.text(1):
+            compression_path = Path(item.text(1))
             compress_action = real_actions.addAction(
                 f"この1件を圧縮（{compression_path.name}）…"
             )
@@ -138,8 +123,8 @@ def add_file_manager_path_actions(
             selected_compress_action.triggered.connect(compress_selected_real_items)
         if extract_one_archive is not None or extract_checked_archives is not None:
             real_actions.addSeparator()
-        if extract_one_archive is not None and item is not None and item.text(1).strip():
-            archive_path = Path(item.text(1).strip())
+        if extract_one_archive is not None and item is not None and item.text(1):
+            archive_path = Path(item.text(1))
             extract_action = real_actions.addAction(
                 f"この1件を解凍（{archive_path.name}）…"
             )
@@ -176,6 +161,10 @@ def add_file_manager_path_actions(
             copy_checked_file_names,
             copy_selected_file_names,
             copy_all_file_names,
+            show_one_tree,
+            show_checked_trees,
+            show_selected_trees,
+            show_all_trees,
         )
     ):
         copy_menu = QMenu("パス・ファイル名コピー", menu)
@@ -184,8 +173,8 @@ def add_file_manager_path_actions(
             ("パス", copy_one_path, copy_checked_paths, copy_selected_paths, copy_all_paths),
             ("ファイル名", copy_one_file_name, copy_checked_file_names, copy_selected_file_names, copy_all_file_names),
         ):
-            if one is not None and item is not None and item.text(1).strip():
-                path = Path(item.text(1).strip())
+            if one is not None and item is not None and item.text(1):
+                path = Path(item.text(1))
                 one_action = copy_menu.addAction(f"{prefix}：この1件をコピー")
                 one_action.triggered.connect(lambda _checked=False, value=path, callback=one: callback(value))
             if checked is not None:
@@ -197,24 +186,54 @@ def add_file_manager_path_actions(
             if all_items is not None:
                 all_action = copy_menu.addAction(f"{prefix}：全件をコピー")
                 all_action.triggered.connect(all_items)
-    expand_menu = QMenu("展開", menu)
-    menu.addMenu(expand_menu)
-    if open_one_directory is not None:
-        open_action = expand_menu.addAction("この1件を開く（一覧全体を置換）")
-        open_action.triggered.connect(open_one_directory)
-    if choose_one_directory is not None:
-        choose_action = expand_menu.addAction("この1件の直下を選んで展開…")
-        choose_action.triggered.connect(choose_one_directory)
-    if open_one_directory is not None or choose_one_directory is not None:
-        expand_menu.addSeparator()
-    checked_expand = expand_menu.addAction("チェック済みフォルダを展開")
-    checked_expand.triggered.connect(lambda: request_expand("checked", False))
-    checked_query = expand_menu.addAction("チェック済みに条件を指定して展開…")
-    checked_query.triggered.connect(lambda: request_expand("checked", True))
-    selected_expand = expand_menu.addAction("選択中フォルダを展開")
-    selected_expand.triggered.connect(lambda: request_expand("selected", False))
-    selected_query = expand_menu.addAction("選択中に条件を指定して展開…")
-    selected_query.triggered.connect(lambda: request_expand("selected", True))
+        if any(
+            callback is not None
+            for callback in (
+                show_one_tree,
+                show_checked_trees,
+                show_selected_trees,
+                show_all_trees,
+            )
+        ):
+            copy_menu.addSeparator()
+            clicked_is_directory = (
+                item is not None
+                and item.text(1)
+                and Path(item.text(1)).is_dir()
+                and not Path(item.text(1)).is_symlink()
+            )
+            if show_one_tree is not None and item is not None and item.text(1):
+                tree_path = Path(item.text(1))
+                one_tree = copy_menu.addAction("ツリー：この1件を表示…")
+                one_tree.setEnabled(clicked_is_directory)
+                one_tree.setToolTip("通常のフォルダだけを、最大4層・1000件までテキスト表示します。")
+                one_tree.triggered.connect(
+                    lambda _checked=False, path=tree_path: show_one_tree(path)
+                )
+            if show_checked_trees is not None:
+                checked_tree = copy_menu.addAction(
+                    f"ツリー：チェック済みフォルダを表示（{checked_tree_directory_count}件）…"
+                )
+                checked_tree.setEnabled(checked_tree_directory_count > 0)
+                checked_tree.triggered.connect(show_checked_trees)
+            if show_selected_trees is not None:
+                selected_tree = copy_menu.addAction(
+                    f"ツリー：選択中フォルダを表示（{selected_tree_directory_count}件）…"
+                )
+                selected_tree.setEnabled(selected_tree_directory_count > 0)
+                selected_tree.triggered.connect(show_selected_trees)
+            if show_all_trees is not None:
+                all_tree = copy_menu.addAction(
+                    f"ツリー：全件のフォルダを表示（{all_tree_directory_count}件）…"
+                )
+                all_tree.setEnabled(all_tree_directory_count > 0)
+                all_tree.triggered.connect(show_all_trees)
+    add_path_expansion_menu(
+        menu,
+        request_expand=request_expand,
+        open_one_directory=open_one_directory,
+        choose_one_directory=choose_one_directory,
+    )
     if send_to_media_information is not None or send_to_video_encoder is not None:
         # Give the submenu an explicit Qt parent.  The context menu is built
         # on demand, so parent ownership is needed after this helper returns.

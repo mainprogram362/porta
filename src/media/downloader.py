@@ -7,6 +7,8 @@ to download or export data.
 
 from __future__ import annotations
 
+from runtime import managed_process
+
 import asyncio
 import csv
 import importlib.util
@@ -655,7 +657,7 @@ def _run_wpc_download_worker(
     }
     with _EphemeralWpcProfile() as profile_path:
         request["profile_path"] = str(profile_path)
-        process = subprocess.Popen(
+        process = managed_process.popen(
             [sys.executable, "-m", "media.wpc_worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -663,6 +665,7 @@ def _run_wpc_download_worker(
             text=True,
             encoding="utf-8",
             bufsize=1,
+            label='動画ダウンロード補助',
         )
         try:
             assert process.stdin is not None

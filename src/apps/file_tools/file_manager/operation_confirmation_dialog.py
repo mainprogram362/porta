@@ -15,8 +15,9 @@ from PySide6.QtWidgets import (
 )
 
 from foundation.path import normalize_path
-from foundation.runtime_activity import runtime_activity
 from gui import PathLineInput
+from gui.operation_worker import OperationWorker
+from gui.layout_policy import preferred_window_size
 
 from .operation_service import (
     OperationKind,
@@ -51,7 +52,7 @@ class OperationConfirmationDialog(QDialog):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("実行内容の最終確認")
-        self.setMinimumSize(760, 620)
+        self.resize(preferred_window_size(self))
         self._kind = kind
         self._targets = targets
         self._mode = mode
@@ -60,6 +61,7 @@ class OperationConfirmationDialog(QDialog):
         self._include_extension = include_extension
         self._presentation: OperationPresentation | None = None
         self._completed = False
+        self._worker = None
 
         layout = QVBoxLayout(self)
         explanation = QLabel(
@@ -92,6 +94,7 @@ class OperationConfirmationDialog(QDialog):
         self.preview_text.setReadOnly(True)
         layout.addWidget(self.preview_text, 1)
         self.status_label = QLabel()
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
@@ -101,6 +104,9 @@ class OperationConfirmationDialog(QDialog):
         buttons.addButton(self.execute_button, QDialogButtonBox.ButtonRole.AcceptRole)
         close = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
         close.clicked.connect(self.reject)
+        self.cancel_button = buttons.addButton("処理を取り消す", QDialogButtonBox.ButtonRole.ActionRole)
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_operation)
         layout.addWidget(buttons)
 
         self._uses_single_destination = kind in {"copy", "move"} and mode == "simple"
@@ -116,13 +122,13 @@ class OperationConfirmationDialog(QDialog):
 
     def _destination_text(self) -> str:
         if self._uses_single_destination:
-            return self.destination_input.text().strip()
+            return self.destination_input.text()
         if self._mode == "one_to_one":
             return "\n".join(str(path) for path in self._destinations)
         return ""
 
     def refresh_preview(self) -> None:
-        if self._completed:
+        if self._completed or self._worker is not None:
             return
         presentation = build_operation_presentation(
             self._kind,
@@ -131,7 +137,7 @@ class OperationConfirmationDialog(QDialog):
             mode=self._mode,
             target_count=len(self._targets),
             destination_count=(
-                1 if self._uses_single_destination and self.destination_input.text().strip()
+                1 if self._uses_single_destination and self.destination_input.text()
                 else (len(self._destinations) if self._mode == "one_to_one" else 0)
             ),
             rename_rules=list(self._rename_rules),
@@ -150,34 +156,80 @@ class OperationConfirmationDialog(QDialog):
         if (
             presentation.is_ready
             and self._uses_single_destination
-            and self.destination_input.text().strip()
+            and self.destination_input.text()
         ):
-            self.destination_remembered.emit(self.destination_input.text().strip())
+            self.destination_remembered.emit(self.destination_input.text())
 
     def execute_current(self) -> None:
         """Rebuild once, then let the workflow revalidate immediately before writing."""
+        if self._worker is not None or self._completed:
+            return
         self.refresh_preview()
         presentation = self._presentation
         if presentation is None or not presentation.is_ready:
             return
         self.execute_button.setEnabled(False)
         self.status_label.setText("実行中です。この画面を閉じないでください。")
-        try:
-            with runtime_activity("ファイル操作中"):
-                results = execute_operation(presentation)
-        except (OSError, ValueError) as exc:
-            message = str(exc)
-            self.status_label.setText(f"実行していません：{message}")
-            self.execute_button.setEnabled(True)
-            self.operation_failed.emit(message)
+        self.destination_input.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self._worker = OperationWorker(lambda: execute_operation(presentation), self)
+        self._worker.progress.connect(self._show_progress)
+        self._worker.succeeded.connect(self._operation_finished)
+        self._worker.failed.connect(self._operation_failed)
+        self._worker.finished.connect(self._worker_finished)
+        self._worker.start()
+
+    def _show_progress(self, text):
+        self.status_label.setText(f"処理中: {text}")
+
+    def cancel_operation(self):
+        if self._worker is not None:
+            self._worker.requestInterruption()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("取消を要求しました。安全に停止できる処理境界まで待っています。")
+
+    def _operation_failed(self, error):
+        self._completed = True
+        records = getattr(error, "records", ())
+        state = "一部完了" if records else "停止（結果を確認）"
+        if getattr(error, "cancelled", False):
+            state += "・取消"
+        message = str(error)
+        self.status_label.setText(f"{state}：再実行する場合は、残った対象で新しく確認画面を開いてください。")
+        details = "\n".join(f"{row.state}: {row.source}\n → {row.output}" for row in records)
+        self.preview_text.setPlainText(self.preview_text.toPlainText()
+                                      + f"\n\n=== {state} ===\n{details}\n{message}")
+        self.execute_button.setEnabled(False)
+        self.operation_failed.emit(message)
+
+    def _worker_finished(self):
+        worker = self._worker
+        self._worker = None
+        self.cancel_button.setEnabled(False)
+        if worker is not None:
+            worker.deleteLater()
+
+    def reject(self):
+        if self._worker is not None:
+            self.cancel_operation()
             return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._worker is not None:
+            self.cancel_operation()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _operation_finished(self, results):
+        presentation = self._presentation
 
         self._completed = True
         self.destination_input.setEnabled(False)
         self.execute_button.setEnabled(False)
         self.status_label.setText(f"{presentation.completed_label}：{len(results)}件")
         result_text = "\n".join(str(path) for path in results)
-        self.preview_text.append(
-            f"\n\n=== 実行結果 ===\n{presentation.result_label}:\n{result_text}"
-        )
+        self.preview_text.setPlainText(self.preview_text.toPlainText()
+                                      + f"\n\n=== 実行結果 ===\n{presentation.result_label}:\n{result_text}")
         self.operation_succeeded.emit(presentation, results)

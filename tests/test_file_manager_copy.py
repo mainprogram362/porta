@@ -122,7 +122,7 @@ def test_copy_preserves_a_symbolic_link_instead_of_copying_its_target(tmp_path: 
     assert target.read_text(encoding="utf-8") == "original"
 
 
-def test_copy_removes_outputs_created_by_this_run_after_a_detected_error(
+def test_copy_keeps_published_outputs_after_a_detected_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     first = tmp_path / "first.txt"
@@ -145,10 +145,11 @@ def test_copy_removes_outputs_created_by_this_run_after_a_detected_error(
 
     monkeypatch.setattr(copy_workflow, "copy_or_move", fail_after_second_copy)
 
-    with pytest.raises(OSError, match="削除を試みました"):
+    with pytest.raises(OSError, match="保持"):
         execute_copy(request)
 
-    assert list(destination.iterdir()) == []
+    assert (destination / first.name).read_text() == "first"
+    assert (destination / second.name).read_text() == "second"
 
 
 def test_one_to_one_copy_requires_equal_source_and_destination_counts(tmp_path: Path):

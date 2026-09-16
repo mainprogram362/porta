@@ -46,6 +46,64 @@ def test_video_encode_preview_builds_non_overwriting_mp4_commands(tmp_path: Path
     assert not item.output.exists()
 
 
+def test_discover_tools_prefers_porta_backend_pair(tmp_path: Path, monkeypatch):
+    bundled = tmp_path / "backend"
+    bundled.mkdir()
+    bundled_ffmpeg = bundled / "ffmpeg"
+    bundled_ffprobe = bundled / "ffprobe"
+    bundled_ffmpeg.write_text("tool")
+    bundled_ffprobe.write_text("tool")
+    monkeypatch.setattr(video_encode, "_BUNDLED_TOOL_DIRECTORY", bundled)
+    monkeypatch.setattr(
+        video_encode.shutil,
+        "which",
+        lambda name: f"/system/{name}",
+    )
+    seen: list[tuple[Path, Path]] = []
+
+    def fake_validate(ffmpeg, ffprobe):
+        pair = (Path(ffmpeg), Path(ffprobe))
+        seen.append(pair)
+        return FFmpegTools(*pair)
+
+    monkeypatch.setattr(video_encode, "validate_tools", fake_validate)
+
+    tools = video_encode.discover_tools()
+
+    assert tools == FFmpegTools(bundled_ffmpeg, bundled_ffprobe)
+    assert seen == [(bundled_ffmpeg, bundled_ffprobe)]
+
+
+def test_discover_tools_falls_back_to_system_pair(tmp_path: Path, monkeypatch):
+    bundled = tmp_path / "missing-backend"
+    monkeypatch.setattr(video_encode, "_BUNDLED_TOOL_DIRECTORY", bundled)
+    monkeypatch.setattr(
+        video_encode.shutil,
+        "which",
+        lambda name: f"/system/{name}",
+    )
+
+    def fake_validate(ffmpeg, ffprobe):
+        pair = (Path(ffmpeg), Path(ffprobe))
+        if pair[0].parent == bundled:
+            raise ValueError("missing")
+        return FFmpegTools(*pair)
+
+    monkeypatch.setattr(video_encode, "validate_tools", fake_validate)
+
+    assert video_encode.discover_tools() == FFmpegTools(
+        Path("/system/ffmpeg"), Path("/system/ffprobe")
+    )
+
+
+def test_discover_tools_requests_manual_paths_when_no_pair_exists(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(video_encode, "_BUNDLED_TOOL_DIRECTORY", tmp_path / "missing")
+    monkeypatch.setattr(video_encode.shutil, "which", lambda _name: None)
+
+    with pytest.raises(ValueError, match="パスを手入力"):
+        video_encode.discover_tools()
+
+
 def test_video_encode_requires_an_existing_output_directory(tmp_path: Path):
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"source")
@@ -110,22 +168,29 @@ def test_video_encoder_screen_defaults_to_explicit_output_directory(tmp_path: Pa
         assert screen.output_directory_input.text() == ""
         assert screen.encode_backend_combo.currentData() == "software"
         assert screen.encode_backend_combo.count() == 4
-        for index in range(1, screen.encode_backend_combo.count()):
+        assert screen.encode_backend_combo.model().item(1).isEnabled()
+        for index in range(2, screen.encode_backend_combo.count()):
             assert not screen.encode_backend_combo.model().item(index).isEnabled()
-        assert "検査していません" in screen.encode_backend_status.text()
+        assert "実機テスト" in screen.encode_backend_status.text()
         assert screen.rules_content.isHidden()
         assert not screen._edit_rules_enabled
     finally:
         screen.close()
 
 
-def test_gpu_backend_is_rejected_before_any_video_probe(tmp_path: Path, monkeypatch):
+def test_nvidia_backend_uses_nvenc_after_a_successful_preflight(tmp_path: Path, monkeypatch):
     source = tmp_path / "clip.mp4"
     source.write_bytes(b"source")
     monkeypatch.setattr(
         video_encode,
         "_probe_video_basics",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("GPU設計段階では動画を調査しない")),
+        lambda *_args: (30.0, False),
+    )
+    checked = []
+    monkeypatch.setattr(
+        video_encode,
+        "validate_encode_backend",
+        lambda tools, request: checked.append((tools, request.encode_backend, request.codec)),
     )
 
     preview = build_encode_preview(
@@ -139,8 +204,26 @@ def test_gpu_backend_is_rejected_before_any_video_probe(tmp_path: Path, monkeypa
         ),
     )
 
+    assert preview.is_ready
+    assert preview.plan is not None
+    assert checked == [(FFmpegTools(Path("/ffmpeg"), Path("/ffprobe")), "nvidia_nvenc", "hevc")]
+    command = preview.plan.items[0].command
+    assert "hevc_nvenc" in command
+    assert "-cq" in command
+    assert "-crf" not in command
+
+
+def test_nvidia_backend_rejects_quality_above_nvenc_range(tmp_path: Path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"source")
+
+    preview = build_encode_preview(
+        FFmpegTools(Path("/ffmpeg"), Path("/ffprobe")),
+        VideoEncodeRequest((source,), tmp_path, "hevc", 52, encode_backend="nvidia_nvenc"),
+    )
+
     assert not preview.is_ready
-    assert "事前テスト機能をまだ接続していない" in preview.text
+    assert "CQ" in preview.text
 
 
 def test_collapsed_edit_rules_are_excluded_from_internal_request_state(monkeypatch):

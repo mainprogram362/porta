@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime.process_registry import get_registry
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -84,19 +86,22 @@ def scan_location(location: ApplicationLocation) -> LocationScan:
 
 
 def launch(application: DiscoveredApplication) -> None:
-    """Explicitly launch one user-configured shell launcher without a shell string."""
+    """Explicitly launch one user-configured ``start.sh`` without a shell string."""
     bash = shutil.which("bash")
     if bash is None:
         raise OSError("bash が見つからないため、このランチャーを起動できません。")
     environment = os.environ.copy()
     original_xdg_config = environment.pop("PORTA_ORIGINAL_XDG_CONFIG_HOME", "")
+    for name in ("QT_IM_MODULE", "GTK_IM_MODULE", "XMODIFIERS"):
+        if environment.pop(f"PORTA_SET_{name}", ""):
+            environment.pop(name, None)
     if original_xdg_config:
         # The parent Qt process may temporarily use ~/.config to reach IBus
         # when it was launched from portable VS Code.  External applications
         # must instead receive exactly the desktop environment that launched
         # PORTA, including the portable application's XDG location.
         environment["XDG_CONFIG_HOME"] = original_xdg_config
-    subprocess.Popen(
+    process = subprocess.Popen(
         [bash, str(application.launcher_path)],
         cwd=str(application.launcher_path.parent),
         env=environment,
@@ -105,3 +110,7 @@ def launch(application: DiscoveredApplication) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # External applications are independent as soon as their launcher starts.
+    # Exclude the launcher PID before the registry's child observer can treat
+    # its browser/editor/service descendants as PORTA work.
+    get_registry().ignore(process.pid)

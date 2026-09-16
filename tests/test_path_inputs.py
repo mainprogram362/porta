@@ -32,10 +32,27 @@ def test_path_list_input_parses_one_normalized_path_per_non_blank_line(tmp_path:
     QApplication.instance() or QApplication([])
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
+    # Paste padding is only trimmed when the unpadded entry actually exists;
+    # otherwise whitespace is preserved as a possible part of the filename.
+    first.touch()
+    second.touch()
     widget = PathListInput()
     widget.setPlainText(f"\n{first}\n\n {second} \n")
 
     assert widget.paths() == [first.resolve(), second.resolve()]
+
+
+def test_path_list_input_preserves_an_existing_filename_with_trailing_space(tmp_path: Path):
+    QApplication.instance() or QApplication([])
+    trailing_space_file = tmp_path / "movie.mp4 "
+    trailing_space_file.write_text("content", encoding="utf-8")
+    widget = PathListInput()
+
+    widget.setPlainText(str(trailing_space_file))
+
+    assert widget.paths() == [trailing_space_file]
+    assert widget.items() == [str(trailing_space_file)]
+    assert widget._tree.topLevelItem(0).text(1) == str(trailing_space_file)
 
 
 def test_path_list_input_keeps_a_symbolic_link_name_and_explains_its_target(tmp_path: Path):
@@ -285,6 +302,22 @@ def test_path_list_input_can_remove_or_retain_checked_rows_without_touching_path
     assert third.exists()
     widget.remove_checked_items()
     assert widget.items() == []
+
+
+def test_path_list_input_can_remove_blue_selected_rows_without_deleting_paths(tmp_path: Path):
+    QApplication.instance() or QApplication([])
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    widget = PathListInput(enable_row_selection=True)
+    widget.setPlainText(f"{first}\n{second}")
+    widget._tree.topLevelItem(1).setSelected(True)
+
+    assert widget.remove_row_selected_items() == 1
+    assert widget.paths() == [first.resolve()]
+    assert first.exists()
+    assert second.exists()
 
 
 def test_path_list_input_checks_new_rows_by_default_and_can_select_or_clear_all():
@@ -689,7 +722,7 @@ def test_path_list_input_displays_current_file_kind_and_state(tmp_path: Path):
     assert widget._tree.topLevelItem(0).toolTip(1) == str(file_path.resolve())
 
 
-def test_path_list_input_keeps_metadata_and_remove_columns_at_fixed_widths():
+def test_path_list_input_sizes_fixed_control_columns_from_the_active_style():
     QApplication.instance() or QApplication([])
     widget = PathListInput()
     header = widget._tree.header()
@@ -699,8 +732,9 @@ def test_path_list_input_keeps_metadata_and_remove_columns_at_fixed_widths():
     assert header.sectionResizeMode(1) == QHeaderView.ResizeMode.Stretch
     assert header.sectionResizeMode(2) == QHeaderView.ResizeMode.Fixed
     assert header.sectionResizeMode(3) == QHeaderView.ResizeMode.Fixed
-    assert widget._tree.columnWidth(0) == 24
-    assert widget._tree.columnWidth(3) == 34
+    assert widget._tree.columnWidth(0) == widget._selection_control_size.width()
+    assert widget._tree.columnWidth(3) == widget._remove_control_size.width()
+    assert widget._selection_control_size.height() >= widget.fontMetrics().lineSpacing()
     assert widget._tree.isHeaderHidden()
     button_texts = {button.text() for button in widget.findChildren(QPushButton)}
     assert {"全選択", "空にする"} <= button_texts

@@ -88,7 +88,7 @@ class WorkspaceRecord:
         return "" if stars is None else f"★{stars:g}"
 
 
-# Compatibility name for callers of the retired standalone viewer model.
+# Compatibility name for callers of the retired viewer model.
 ViewerRecord = WorkspaceRecord
 
 

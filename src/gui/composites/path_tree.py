@@ -36,6 +36,14 @@ class InputRowDelegate(QStyledItemDelegate):
             return None
         return super().createEditor(parent, option, index)
 
+    def sizeHint(self, option, index):  # type: ignore[no-untyped-def]
+        size = super().sizeHint(option, index)
+        if index.column() == 1 and index.data(INPUT_ROW_ROLE):
+            text = ("ロック中：ロック解除でパスを変更" if self.parent()._owner._paths_locked
+                    else "ダブルクリックしてパスを追加")
+            size.setWidth(max(size.width(), option.fontMetrics.horizontalAdvance(text) + 12))
+        return size
+
     def paint(self, painter, option, index) -> None:  # type: ignore[no-untyped-def]
         if index.column() != 1 or not index.data(INPUT_ROW_ROLE):
             super().paint(painter, option, index)
@@ -77,6 +85,12 @@ class PathTreeWidget(QTreeWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_path_context_menu)
 
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
+        super().resizeEvent(event)
+        # A full-path column fills an empty viewport, but may exceed it for a
+        # genuinely long path. Qt has laid out fixed columns by this point.
+        self._owner._fit_full_path_column_to_viewport()
+
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         position = event.position().toPoint()
         item = self.itemAt(position)
@@ -96,7 +110,7 @@ class PathTreeWidget(QTreeWidget):
             and self.columnAt(position.x()) == 1
             and not self._owner._is_input_row(item)
             and not self._owner.is_virtual_item(item)
-            and item.text(1).strip()
+            and item.text(1)
             and not self._owner._paths_locked
         ):
             self._path_drag_start = position
@@ -110,7 +124,7 @@ class PathTreeWidget(QTreeWidget):
         position = event.position().toPoint()
         if self._path_drag_start is not None and self._path_drag_item is not None:
             if (position - self._path_drag_start).manhattanLength() >= QApplication.startDragDistance():
-                path = normalize_path(self._path_drag_item.text(1).strip())
+                path = normalize_path(self._path_drag_item.text(1))
                 mime_data = QMimeData()
                 mime_data.setUrls([QUrl.fromLocalFile(str(path))])
                 mime_data.setData(PATH_LIST_DRAG_SOURCE_MIME, self._own_drag_token)
@@ -197,8 +211,8 @@ class PathTreeWidget(QTreeWidget):
         if exclusive_menu is not None:
             return exclusive_menu
         menu = QMenu(self)
-        if item is not None and not self._owner._is_input_row(item) and item.text(1).strip():
-            path_text = item.text(1).strip()
+        if item is not None and not self._owner._is_input_row(item) and item.text(1):
+            path_text = item.text(1)
             is_virtual = self._owner.is_virtual_item(item)
             if not self._owner._paths_locked and self._owner._context_menu_selection_actions:
                 checked = self._owner._item_is_selected(item)
@@ -216,12 +230,12 @@ class PathTreeWidget(QTreeWidget):
             item is not None
             and not self._owner._is_input_row(item)
             and not self._owner.is_virtual_item(item)
-            and item.text(1).strip()
+            and item.text(1)
         ):
             open_action = menu.addAction("標準ファイルマネージャーで開く")
             open_action.setToolTip("このパスの場所を標準ファイルマネージャーで開きます。")
             open_action.triggered.connect(
-                lambda: open_in_standard_file_manager(normalize_path(item.text(1).strip()))
+                lambda: open_in_standard_file_manager(normalize_path(item.text(1)))
             )
         else:
             open_action = menu.addAction("ホームフォルダを開く")

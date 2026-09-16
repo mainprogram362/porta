@@ -5,11 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 
 from foundation.filesystem import copy_or_move
-from foundation.path import normalize_path, path_entry_exists
+from foundation.path import normalize_path, path_entry_exists, path_text_from_input
 from foundation.path_inspection import inspect_path, inspect_paths
+from runtime.operation_progress import completed
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ def _parse_path_lines(text: str, *, deduplicate: bool) -> tuple[Path, ...]:
     paths: list[Path] = []
     seen: set[Path] = set()
     for raw_line in text.splitlines():
-        line = raw_line.strip()
+        line = path_text_from_input(raw_line)
         if not line:
             continue
         path = normalize_path(line)
@@ -248,12 +248,12 @@ def execute_one_to_one_copy(request: OneToOneCopyRequest) -> list[Path]:
 
 def execute_copy_plan(plan: CopyPlan) -> list[Path]:
     """Revalidate a displayed plan, then copy directly to its exact outputs."""
-    _validate_plan_is_current(plan)
+    validate_copy_plan_is_current(plan)
     return _execute_direct_copy(plan.copies)
 
 
-def _validate_plan_is_current(plan: CopyPlan) -> None:
-    """Abort before copying if anything relevant changed after the preview."""
+def validate_copy_plan_is_current(plan: CopyPlan) -> None:
+    """Abort before an operation if anything relevant changed after its preview."""
     sources = tuple(copy.source for copy in plan.copies)
     destinations = tuple(copy.destination for copy in plan.copies)
     missing = [info.path for info in inspect_paths(sources) if not info.is_operable]
@@ -268,11 +268,7 @@ def _validate_plan_is_current(plan: CopyPlan) -> None:
 
 
 def _execute_direct_copy(copies: Iterable[PlannedCopy]) -> list[Path]:
-    """Copy directly to final destinations without creating a staging area.
-
-    If an error is detected, only outputs created by this invocation are
-    removed. No operation log or temporary copy tree is created.
-    """
+    """Keep completed outputs on failure; never clean up a public path by name."""
     created: list[Path] = []
     pending_output: Path | None = None
     try:
@@ -287,23 +283,12 @@ def _execute_direct_copy(copies: Iterable[PlannedCopy]) -> list[Path]:
                 collision_mode="error",
             )
             created.append(copied)
+            completed(planned.source, copied, "コピー完了")
             pending_output = None
-    except Exception:
-        _remove_created_outputs(created, pending_output)
+    except Exception as exc:
         raise OSError(
-            "コピー中にエラーが発生しました。今回作成した出力は削除を試みました。"
-        ) from None
+            "コピー中に停止しました。作成済みの出力は保持しています。\n"
+            + "\n".join(str(path) for path in created)
+            + f"\n停止した出力先: {pending_output}\n理由: {exc}"
+        ) from exc
     return created
-
-
-def _remove_created_outputs(created: list[Path], pending_output: Path | None) -> None:
-    """Best-effort cleanup limited to outputs from the current direct copy."""
-    outputs = [*created, *([pending_output] if pending_output is not None else [])]
-    for output in reversed(outputs):
-        try:
-            if output.is_symlink() or output.is_file():
-                output.unlink(missing_ok=True)
-            elif output.is_dir():
-                shutil.rmtree(output, ignore_errors=True)
-        except OSError:
-            continue

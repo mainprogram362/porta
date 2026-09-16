@@ -18,7 +18,7 @@ def test_home_token_is_visible_in_templates_but_expanded_for_runtime():
     assert json.loads(youtube_settings.template_text())["download_output_directory"] == HOME_TOKEN
 
     loaded = youtube_settings.validate_text(
-        '{"download_output_directory":"${HOME}/Videos","metadata_export_directory":"${HOME}","catalog_json_path":""}'
+        '{"download_output_directory":"@HOME/Videos","metadata_export_directory":"@HOME","catalog_json_path":""}'
     )
 
     assert loaded["download_output_directory"] == str(Path.home() / "Videos")
@@ -30,7 +30,7 @@ def test_saving_keeps_the_explicit_home_token(tmp_path, monkeypatch):
     monkeypatch.setattr(youtube_settings, "SETTINGS_PATH", path)
 
     youtube_settings.save_text(
-        '{"download_output_directory":"${HOME}","metadata_export_directory":"${HOME}","catalog_json_path":""}'
+        '{"download_output_directory":"@HOME","metadata_export_directory":"@HOME","catalog_json_path":""}'
     )
 
     assert json.loads(path.read_text(encoding="utf-8"))["download_output_directory"] == HOME_TOKEN

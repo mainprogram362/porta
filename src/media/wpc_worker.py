@@ -91,4 +91,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runtime.instance_presence import InstancePresence
+
+    presence = InstancePresence(role="worker", screen="動画ダウンロード補助", state="処理中")
+    try:
+        raise SystemExit(main())
+    finally:
+        presence.close()

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import (
     QDragEnterEvent,
     QDragMoveEvent,
@@ -28,11 +29,12 @@ from PySide6.QtWidgets import (
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
 
-from foundation.path import normalize_path
+from foundation.path import normalize_path, path_text_from_input
 from foundation.path_inspection import PathInfo, inspect_path
 
 from .line_inputs import LineListInput, PathLineInput
@@ -106,6 +108,16 @@ class PathListInput(QWidget):
     textChanged = Signal()
     selectionChanged = Signal()
     operationTargetsChanged = Signal()
+
+    def _intrinsic_tool_size(self, labels: tuple[str, ...]) -> QSize:
+        """Measure a compact cell control using the active Qt style and font."""
+        probe = QToolButton(self)
+        sizes = []
+        for label in labels:
+            probe.setText(label)
+            sizes.append(probe.sizeHint())
+        probe.deleteLater()
+        return QSize(max(size.width() for size in sizes), max(size.height() for size in sizes))
     rowSelectionChanged = Signal()
     actionPerformed = Signal(str)
     itemClicked = Signal(object, int)
@@ -162,6 +174,10 @@ class PathListInput(QWidget):
         self._direct_child_filter = direct_child_filter
         self._path_column_resizable = path_column_resizable
         self._path_column_label = path_column_label or "パス"
+        self._full_path_mode = False
+        self._full_path_auto_width: int | None = None
+        self._full_path_user_width: int | None = None
+        self._adjusting_full_path_width = False
         self._supplemental_labels = (
             (supplemental_column_label,)
             if supplemental_column_label
@@ -238,6 +254,7 @@ class PathListInput(QWidget):
         headers.extend(["", ""])
         self._tree.setHeaderLabels(headers)
         self._tree.setRootIsDecorated(False)
+        self._tree.setUniformRowHeights(True)
         self._tree.setTextElideMode(Qt.TextElideMode.ElideLeft)
         self._tree.setItemDelegateForColumn(1, InputRowDelegate(self._tree))
         header = self._tree.header()
@@ -245,9 +262,19 @@ class PathListInput(QWidget):
         # dragging a header reorder another column unexpectedly.
         header.setSectionsMovable(False)
         header.setCascadingSectionResizes(False)
+        header.sectionResized.connect(self._path_column_resized)
         # The selection control is intentionally compact.  Qt's default
         # minimum section size is wider than this control, so lower it here.
-        header.setMinimumSectionSize(24)
+        header.setMinimumSectionSize(max(1, self.fontMetrics().horizontalAdvance("0")))
+        self._selection_control_size = self._intrinsic_tool_size(("✓",))
+        self._operation_control_size = self._intrinsic_tool_size(("対象", "除外"))
+        self._remove_control_size = self._intrinsic_tool_size(("×",))
+        self._row_height = max(
+            self.fontMetrics().lineSpacing(),
+            self._selection_control_size.height(),
+            self._operation_control_size.height() if show_operation_targets else 0,
+            self._remove_control_size.height(),
+        )
         # QTreeWidget stretches the final column by default.  Here the final
         # column is only the × control, so that behaviour would waste path
         # space; only the path column may consume remaining width.
@@ -262,7 +289,7 @@ class PathListInput(QWidget):
             else QHeaderView.ResizeMode.Stretch,
         )
         if path_column_resizable:
-            self._tree.setColumnWidth(1, 300)
+            self._tree.setColumnWidth(1, self.fontMetrics().horizontalAdvance("0") * 36)
         # Selection, status and the UI-only removal control must not steal width from
         # the actual path, which is the only column that benefits from growth.
         for label, column in self._supplemental_columns.items():
@@ -278,18 +305,21 @@ class PathListInput(QWidget):
                 else QHeaderView.ResizeMode.Interactive,
             )
             if len(self._supplemental_columns) > 1 or supplemental_before_operation_targets:
-                self._tree.setColumnWidth(column, 120)
+                self._tree.setColumnWidth(
+                    column,
+                    max(header.sectionSizeHint(column), self.fontMetrics().horizontalAdvance("0") * 12),
+                )
         header.setSectionResizeMode(self._state_column, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(self._remove_column, QHeaderView.ResizeMode.Fixed)
-        self._tree.setColumnWidth(0, 24)
+        self._tree.setColumnWidth(0, self._selection_control_size.width())
         if self._operation_target_column is not None:
-            self._tree.setColumnWidth(self._operation_target_column, 50)
-        self._tree.setColumnWidth(self._state_column, 30)
-        self._tree.setColumnWidth(self._remove_column, 34)
+            self._tree.setColumnWidth(self._operation_target_column, self._operation_control_size.width())
+        self._tree.setColumnWidth(self._state_column, max(header.sectionSizeHint(self._state_column), self._row_height))
+        self._tree.setColumnWidth(self._remove_column, self._remove_control_size.width())
         # Most path inputs remain compact without labels.  Information-dense
         # lists can opt in so values such as "1920×1080" are not ambiguous.
-        header_height = 26 if show_column_headers else 0
-        self._tree.setMinimumHeight(max(30, rows * 24 + header_height))
+        self._header_height = header.sizeHint().height() if show_column_headers else 0
+        self._tree.setMinimumHeight(rows * self._row_height + self._header_height)
         self._tree.setHeaderHidden(not show_column_headers)
         column_description = "左から：チェック、パス"
         if self._operation_target_column is not None:
@@ -321,6 +351,100 @@ class PathListInput(QWidget):
         self._normalize_input_row()
         self._update_selection_toggle_button()
 
+    def show_full_paths(self) -> None:
+        """Show complete path text without leaving a short empty table.
+
+        The path column fills an empty viewport at minimum. A longer path may
+        exceed it, in which case the horizontal scroll bar reveals the whole
+        path and the fixed right-side controls.
+        """
+        self._tree.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        header = self._tree.header()
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self._tree.setHeaderHidden(False)
+        self._full_path_mode = True
+        self._full_path_auto_width = None
+        self._full_path_user_width = None
+        self._fit_full_path_column_to_viewport()
+        self._tree.setToolTip("パスを省略せず表示します。長いパスは下部の横スクロールで全文を確認できます。")
+
+    def _path_column_resized(self, column: int, _old_size: int, new_size: int) -> None:
+        """Keep an explicit drag, while never leaving an empty right side."""
+        if column != 1 or not self._full_path_mode or self._adjusting_full_path_width:
+            return
+        self._full_path_user_width = new_size
+        self._fit_full_path_column_to_viewport()
+
+    def _full_path_viewport_width(self) -> int:
+        viewport_width = self._tree.viewport().width()
+        if viewport_width <= 0:
+            return 0
+        fixed_width = sum(
+            self._tree.columnWidth(column)
+            for column in range(self._tree.columnCount())
+            if column != 1 and not self._tree.isColumnHidden(column)
+        )
+        return max(1, viewport_width - fixed_width)
+
+    def _full_path_content_width(self) -> int:
+        margin = self.style().pixelMetric(QStyle.PixelMetric.PM_HeaderMargin) * 2
+        return max(
+            self._tree.sizeHintForColumn(1),
+            self.fontMetrics().horizontalAdvance(self._path_column_label) + margin,
+        )
+
+    def _fit_full_path_column_to_viewport(self) -> None:
+        """Fill unused width or preserve a user/long-path width for scrolling."""
+        if not self._full_path_mode or self._adjusting_full_path_width:
+            return
+        minimum = self._full_path_viewport_width()
+        if minimum <= 0:
+            return
+        desired = max(
+            minimum,
+            self._full_path_user_width
+            if self._full_path_user_width is not None
+            else self._full_path_content_width(),
+        )
+        if self._tree.columnWidth(1) == desired:
+            self._full_path_auto_width = desired
+            return
+        self._adjusting_full_path_width = True
+        try:
+            self._tree.setColumnWidth(1, desired)
+            self._full_path_auto_width = desired
+        finally:
+            self._adjusting_full_path_width = False
+
+    def set_path_column_stretch(self, enabled: bool) -> None:
+        """Let the path field consume spare width when no fact field can."""
+        if self._full_path_mode:
+            raise RuntimeError("フルパス表示ではパス列の伸縮方式を変更できません。")
+        self._tree.header().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.Stretch
+            if enabled or not self._path_column_resizable
+            else QHeaderView.ResizeMode.Interactive,
+        )
+
+    def set_stretch_supplemental_column(self, label: str | None) -> None:
+        """Make one visible fact column take remaining width."""
+        if label is not None and label not in self._supplemental_columns:
+            raise ValueError("伸長する補助列がありません。")
+        self._stretch_supplemental_column_label = label or ""
+        header = self._tree.header()
+        for current_label, column in self._supplemental_columns.items():
+            if header.sectionResizeMode(column) == QHeaderView.ResizeMode.Fixed:
+                continue
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch
+                if current_label == label and not self._tree.isColumnHidden(column)
+                else QHeaderView.ResizeMode.Interactive,
+            )
+
     def maximum_items(self) -> int | None:
         """Return the current data-row limit, if this list has one."""
         return self._maximum_items
@@ -336,13 +460,14 @@ class PathListInput(QWidget):
 
     def set_visible_rows(self, rows: int, *, fixed: bool = False) -> None:
         """Adjust the compact height while retaining the same path-table API."""
-        height = max(30, rows * 24)
+        height = rows * self._row_height + self._header_height
         self._tree.setMinimumHeight(height)
         if fixed:
             # A tree row itself fits in ``height`` but its styled frame needs
             # a little room above and below.  Keep the visual one-line form
             # without clipping that frame.
-            self.setFixedHeight(height + 4)
+            margins = self.layout().contentsMargins()
+            self.setFixedHeight(height + margins.top() + margins.bottom())
             return
         self.setMinimumHeight(height)
         self.setMaximumHeight(16_777_215)
@@ -409,7 +534,7 @@ class PathListInput(QWidget):
             item = self._tree.topLevelItem(index)
             if self._is_input_row(item):
                 continue
-            path_text = item.text(1).strip()
+            path_text = item.text(1)
             token = self.item_token(item)
             row_values = values.get(token)
             if row_values is None:
@@ -501,6 +626,11 @@ class PathListInput(QWidget):
         column = self._supplemental_columns.get(label)
         if column is not None:
             self._tree.setColumnHidden(column, not visible)
+            # Qt can retain the former width of a hidden fixed/stretch section
+            # in the positions of following sections. Re-layout now so state
+            # and removal controls stay at the visible right edge.
+            self._tree.header().resizeSections(QHeaderView.ResizeMode.Fixed)
+            self._fit_full_path_column_to_viewport()
 
     def set_supplemental_cell_change_kinds(self, values: dict[str, dict[str, str]]) -> None:
         """Mark app-owned cells as pending additions, removals or changes.
@@ -542,6 +672,18 @@ class PathListInput(QWidget):
         column = self._supplemental_columns.get(label)
         if column is not None:
             self._tree.setColumnWidth(column, max(30, width))
+
+    def set_supplemental_column_sample(self, label: str, sample: str) -> None:
+        """Choose an initial column width from representative content."""
+        column = self._supplemental_columns.get(label)
+        if column is None:
+            return
+        margin = self.style().pixelMetric(QStyle.PixelMetric.PM_HeaderMargin) * 2
+        width = max(
+            self._tree.header().sectionSizeHint(column),
+            self._tree.fontMetrics().horizontalAdvance(sample) + margin,
+        )
+        self._tree.setColumnWidth(column, width)
 
     def set_supplemental_column_fixed(self, label: str, width: int | None = None) -> None:
         """Keep one compact app-owned column at the right-side fixed width.
@@ -640,52 +782,70 @@ class PathListInput(QWidget):
 
     def setPlainText(self, text: str) -> None:  # noqa: N802
         """Replace data rows with non-blank lines from text."""
-        self._tree.clear()
-        self._append_items(text.splitlines())
-        self._normalize_input_row()
-        self._update_selection_toggle_button()
+        with self._bulk_tree_update():
+            self._tree.clear()
+            self._append_items(text.splitlines())
+            self._normalize_input_row()
+            self._update_selection_toggle_button()
         self.textChanged.emit()
+
+    @contextmanager
+    def _bulk_tree_update(self):
+        """Fit the complete path column once per batch, not once per widget."""
+        header = self._tree.header()
+        mode = header.sectionResizeMode(1)
+        updates = self._tree.updatesEnabled()
+        blocked = self._tree.blockSignals(True)
+        self._tree.setUpdatesEnabled(False)
+        if mode == QHeaderView.ResizeMode.ResizeToContents:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        try:
+            yield
+        finally:
+            header.setSectionResizeMode(1, mode)
+            self._tree.blockSignals(blocked)
+            self._tree.setUpdatesEnabled(updates)
 
     def items(self, *, deduplicate: bool = False) -> list[str]:
         """Return non-blank path texts, optionally removing duplicates."""
         values = [
-            self._tree.topLevelItem(index).text(1).strip()
+            self._tree.topLevelItem(index).text(1)
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(self._tree.topLevelItem(index))
-            and self._tree.topLevelItem(index).text(1).strip()
+            and self._tree.topLevelItem(index).text(1)
         ]
         return list(dict.fromkeys(values)) if deduplicate else values
 
     def paths(self, *, deduplicate: bool = False) -> list[Path]:
         """Return normalized paths for each current data row."""
         return [
-            normalize_path(item.text(1).strip())
+            normalize_path(item.text(1))
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(item := self._tree.topLevelItem(index))
             and not self.is_virtual_item(item)
-            and item.text(1).strip()
+            and item.text(1)
         ]
 
     def selected_items(self, *, deduplicate: bool = False) -> list[str]:
         """Return checkbox-selected data rows in their visual order."""
         values = [
-            self._tree.topLevelItem(index).text(1).strip()
+            self._tree.topLevelItem(index).text(1)
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(self._tree.topLevelItem(index))
             and self._item_is_selected(self._tree.topLevelItem(index))
-            and self._tree.topLevelItem(index).text(1).strip()
+            and self._tree.topLevelItem(index).text(1)
         ]
         return list(dict.fromkeys(values)) if deduplicate else values
 
     def selected_paths(self, *, deduplicate: bool = False) -> list[Path]:
         """Return normalized paths for selected data rows."""
         values = [
-            str(normalize_path(item.text(1).strip()))
+            str(normalize_path(item.text(1)))
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(item := self._tree.topLevelItem(index))
             and not self.is_virtual_item(item)
             and self._item_is_selected(item)
-            and item.text(1).strip()
+            and item.text(1)
         ]
         if deduplicate:
             values = list(dict.fromkeys(values))
@@ -694,11 +854,11 @@ class PathListInput(QWidget):
     def row_selected_paths(self, *, deduplicate: bool = False) -> list[Path]:
         """Return blue-highlighted rows, independently of check and target states."""
         values = [
-            str(normalize_path(item.text(1).strip()))
+            str(normalize_path(item.text(1)))
             for item in self._tree.selectedItems()
             if not self._is_input_row(item)
             and not self.is_virtual_item(item)
-            and item.text(1).strip()
+            and item.text(1)
         ]
         if deduplicate:
             values = list(dict.fromkeys(values))
@@ -732,7 +892,7 @@ class PathListInput(QWidget):
     def item_token(self, item: QTreeWidgetItem) -> str:
         """Return a row's app-owned identity, distinct from its display text."""
         token = item.data(1, _ROW_TOKEN_ROLE)
-        return str(token) if token else str(normalize_path(item.text(1).strip()))
+        return str(token) if token else str(normalize_path(item.text(1)))
 
     @staticmethod
     def is_virtual_item(item: QTreeWidgetItem) -> bool:
@@ -789,11 +949,11 @@ class PathListInput(QWidget):
         if self._operation_target_column is None:
             return self.items(deduplicate=deduplicate)
         values = [
-            item.text(1).strip()
+            item.text(1)
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(item := self._tree.topLevelItem(index))
             and self._operation_target_enabled(item)
-            and item.text(1).strip()
+            and item.text(1)
         ]
         return list(dict.fromkeys(values)) if deduplicate else values
 
@@ -809,9 +969,9 @@ class PathListInput(QWidget):
     def snapshot(self) -> tuple[tuple[object, ...], ...]:
         """Return transient path and checkbox state for UI-only undo/redo."""
         return tuple(
-            (item.text(1).strip(), self._item_is_selected(item), self._operation_target_enabled(item))
+            (item.text(1), self._item_is_selected(item), self._operation_target_enabled(item))
             if self._operation_target_column is not None
-            else (item.text(1).strip(), self._item_is_selected(item))
+            else (item.text(1), self._item_is_selected(item))
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(item := self._tree.topLevelItem(index))
         )
@@ -833,7 +993,7 @@ class PathListInput(QWidget):
 
     def replace_operation_target_items(self, values: Iterable[str]) -> None:
         """Replace enabled execution rows in-place, preserving unrelated candidates."""
-        replacements = [value.strip() for value in values if value.strip()]
+        replacements = [value for value in values if value]
         targets = [
             self._tree.topLevelItem(index)
             for index in range(self._tree.topLevelItemCount())
@@ -850,7 +1010,7 @@ class PathListInput(QWidget):
 
     def replace_checked_item_values(self, values: Iterable[str]) -> None:
         """Replace checkbox-selected rows in place without involving blue selection."""
-        replacements = [value.strip() for value in values if value.strip()]
+        replacements = [value for value in values if value]
         checked_items = [
             self._tree.topLevelItem(index)
             for index in range(self._tree.topLevelItemCount())
@@ -895,6 +1055,13 @@ class PathListInput(QWidget):
         )
         self.actionPerformed.emit(f"チェック済み{count}件を一覧から除外しました。")
 
+    def remove_row_selected_items(self) -> int:
+        """Remove blue-highlighted rows from this UI list without deleting paths."""
+        selected = set(self._tree.selectedItems())
+        count = self._remove_rows(lambda item: item in selected)
+        self.actionPerformed.emit(f"選択対象{count}件を一覧から除外しました。")
+        return count
+
     def select_all_items(self) -> None:
         """Check every data row in this UI-only list."""
         self._set_all_check_states(Qt.CheckState.Checked)
@@ -913,7 +1080,7 @@ class PathListInput(QWidget):
         changed = 0
         for row in range(self._input_row_index()):
             item = self._tree.topLevelItem(row)
-            value = item.text(1).strip()
+            value = item.text(1)
             is_match = str(normalize_path(value)) in matched if value else False
             before = self._item_is_selected(item)
             if mode == "replace":
@@ -949,7 +1116,7 @@ class PathListInput(QWidget):
         seen: set[str] = set()
 
         def is_duplicate(item: QTreeWidgetItem) -> bool:
-            value = item.text(1).strip()
+            value = item.text(1)
             if value in seen:
                 return True
             seen.add(value)
@@ -960,7 +1127,7 @@ class PathListInput(QWidget):
 
     def remove_missing_items(self) -> None:
         """Remove only rows whose current path state is missing."""
-        count = self._remove_rows(lambda item: inspect_path(item.text(1).strip()).kind == "missing")
+        count = self._remove_rows(lambda item: inspect_path(item.text(1)).kind == "missing")
         self.actionPerformed.emit(f"存在しない項目{count}件を一覧から除外しました。")
 
     def remove_item(self, item: QTreeWidgetItem) -> None:
@@ -1003,12 +1170,12 @@ class PathListInput(QWidget):
     def replace_checked_items(self, values: Iterable[str]) -> None:
         """Remove checked rows and append replacement paths within this list only."""
         remaining = [
-            (item.text(1).strip(), self._item_is_selected(item))
+            (item.text(1), self._item_is_selected(item))
             for index in range(self._tree.topLevelItemCount())
             if not self._is_input_row(item := self._tree.topLevelItem(index))
             and not self._item_is_selected(item)
         ]
-        additions = [value.strip() for value in values if value.strip() and self._accepts_path(value)]
+        additions = [value for value in values if value and self._accepts_path(value)]
         self.setPlainText("\n".join([path for path, _checked in remaining] + additions))
         for index, (_path, checked) in enumerate(remaining):
             self._set_item_selected(self._tree.topLevelItem(index), checked)
@@ -1018,7 +1185,7 @@ class PathListInput(QWidget):
         selected = set(self._tree.selectedItems())
         remaining = [
             (
-                item.text(1).strip(),
+                item.text(1),
                 self._item_is_selected(item),
                 self._operation_target_enabled(item),
             )
@@ -1026,7 +1193,7 @@ class PathListInput(QWidget):
             if not self._is_input_row(item := self._tree.topLevelItem(index))
             and item not in selected
         ]
-        additions = [value.strip() for value in values if value.strip() and self._accepts_path(value)]
+        additions = [value for value in values if value and self._accepts_path(value)]
         self.setPlainText("\n".join((*[path for path, _checked, _target in remaining], *additions)))
         for index, (_path, checked, operation_target) in enumerate(remaining):
             item = self._tree.topLevelItem(index)
@@ -1073,7 +1240,7 @@ class PathListInput(QWidget):
             item = self._tree.topLevelItem(index)
             if self._is_input_row(item):
                 continue
-            info = inspect_path(item.text(1).strip())
+            info = inspect_path(item.text(1))
             self._set_item_state(item, info)
             infos.append(info)
         return tuple(infos)
@@ -1122,19 +1289,21 @@ class PathListInput(QWidget):
 
     def _append_items(self, values: Iterable[str]) -> bool:
         additions = [
-            value.strip()
+            path_text_from_input(value)
             for value in values
-            if value.strip() and self._accepts_path(value.strip())
+            if value and self._accepts_path(path_text_from_input(value))
         ]
         if self._maximum_items is not None:
             remaining = self._maximum_items - len(self.items())
             additions = additions[:max(0, remaining)]
-        for value in additions:
-            item = self._new_data_item(value)
-            self._tree.insertTopLevelItem(self._input_row_index(), item)
-            self._add_selection_button(item)
-            self._add_operation_target_button(item)
-            self._add_remove_button(item)
+        with self._bulk_tree_update():
+            insertion = self._input_row_index()
+            items = [self._new_data_item(value) for value in additions]
+            self._tree.insertTopLevelItems(insertion, items)
+            for item in items:
+                self._add_selection_button(item)
+                self._add_operation_target_button(item)
+                self._add_remove_button(item)
         return bool(additions)
 
     def _new_data_item(self, value: str) -> QTreeWidgetItem:
@@ -1213,7 +1382,7 @@ class PathListInput(QWidget):
         button = QToolButton()
         button.setCheckable(True)
         button.setChecked(self._item_is_selected(item))
-        button.setFixedSize(24, 22)
+        button.setFixedSize(self._selection_control_size)
         self._update_selection_cell_button(button)
         button.toggled.connect(
             lambda _checked=False, row=item, control=button: self._selection_cell_toggled(row, control)
@@ -1257,7 +1426,7 @@ class PathListInput(QWidget):
         button = QToolButton()
         button.setCheckable(True)
         button.setChecked(True)
-        button.setFixedSize(46, 22)
+        button.setFixedSize(self._operation_control_size)
         self._update_operation_target_button(button)
         button.toggled.connect(lambda _checked=False, control=button: self._operation_target_toggled(control))
         self._tree.setItemWidget(item, self._operation_target_column, button)
@@ -1285,7 +1454,7 @@ class PathListInput(QWidget):
         """Attach a full path and immediate child counts to one hovered path."""
         if self._is_input_row(item) or self.is_virtual_item(item):
             return
-        info = inspect_path(item.text(1).strip())
+        info = inspect_path(item.text(1))
         tooltip = self._path_tooltip(info)
         if info.kind in {"directory", "symlink_directory"}:
             files, directories, error = _direct_child_counts(info.path)
@@ -1336,7 +1505,7 @@ class PathListInput(QWidget):
             or self.is_virtual_item(item)
         ):
             return False
-        info = inspect_path(item.text(1).strip())
+        info = inspect_path(item.text(1))
         if info.kind != "directory":
             return False
         try:
@@ -1387,7 +1556,7 @@ class PathListInput(QWidget):
             or self.is_virtual_item(item)
         ):
             return False
-        info = inspect_path(item.text(1).strip())
+        info = inspect_path(item.text(1))
         # Do not follow directory symlinks implicitly.  They can point outside
         # the collection a user meant to browse, so ordinary folders alone are
         # eligible for this convenient shortcut.
@@ -1459,7 +1628,6 @@ class PathListInput(QWidget):
         """Ask for direct children without making any filesystem changes."""
         dialog = QDialog(self)
         dialog.setWindowTitle("直下項目を選択")
-        dialog.setMinimumSize(620, 360)
         layout = QVBoxLayout(dialog)
         explanation = QLabel(
             "追加したい直下項目へチェックを入れてください。確定すると元のフォルダ行だけを外し、"
@@ -1488,8 +1656,10 @@ class PathListInput(QWidget):
                 Qt.CheckState.Checked if len(candidates) == 1 else Qt.CheckState.Unchecked,
             )
             choices.addTopLevelItem(item)
-        choices.setColumnWidth(0, 180)
-        choices.setColumnWidth(1, 120)
+        choices_header = choices.header()
+        choices_header.setSectionResizeMode(0, choices_header.ResizeMode.ResizeToContents)
+        choices_header.setSectionResizeMode(1, choices_header.ResizeMode.ResizeToContents)
+        choices_header.setSectionResizeMode(2, choices_header.ResizeMode.Stretch)
         layout.addWidget(choices, 1)
 
         buttons = QDialogButtonBox(
@@ -1569,7 +1739,9 @@ class PathListInput(QWidget):
         try:
             for row in range(self._tree.topLevelItemCount() - 1, -1, -1):
                 item = self._tree.topLevelItem(row)
-                value = item.text(1).strip()
+                value = path_text_from_input(item.text(1))
+                if value != item.text(1):
+                    item.setText(1, value)
                 if not value or not self._accepts_path(value):
                     self._tree.takeTopLevelItem(row)
                     continue
@@ -1594,11 +1766,12 @@ class PathListInput(QWidget):
                 self._tree.addTopLevelItem(input_row)
         finally:
             self._normalizing = already_normalizing
+        self._fit_full_path_column_to_viewport()
 
     def _add_remove_button(self, item: QTreeWidgetItem) -> None:
         remove_button = QToolButton()
         remove_button.setText("×")
-        remove_button.setFixedSize(26, 22)
+        remove_button.setFixedSize(self._remove_control_size)
         remove_button.setToolTip("この一覧から除外します。実ファイルは削除しません。")
         remove_button.clicked.connect(lambda _checked=False, row=item: self.remove_item(row))
         self._tree.setItemWidget(item, self._remove_column, remove_button)

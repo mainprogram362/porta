@@ -6,14 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foundation.path_tokens import expand_setting_path
-from foundation.json_settings import (
-    atomic_write_json,
-    create_app_settings_file,
-    editable_settings_text,
-    settings_destination,
-    validated_settings_status,
-)
+from settings.persistent_settings import config_path_text, resolve_config_path
+from settings.json_settings import atomic_write_json, create_app_settings_file, editable_settings_text, settings_destination, validated_settings_status
 
 
 SETTINGS_FILE_NAME = "local_ai.json"
@@ -75,9 +69,9 @@ def _validate_optional_absolute_path(value: Any, key: str) -> str:
     text = value.strip()
     if not text:
         return ""
-    expanded = expand_setting_path(text)
+    expanded = resolve_config_path(text)
     if "\x00" in expanded or not Path(expanded).is_absolute():
-        raise ValueError(f"{key} は @HOME、~、または / から始まる絶対パスにしてください。")
+        raise ValueError(f"{key} は共通パス記法、相対パス、または絶対パスにしてください。")
     return str(Path(expanded))
 
 
@@ -104,5 +98,8 @@ def create_settings_file() -> Path:
 def save_text(text: str) -> dict[str, str]:
     settings = validate_text(text)
     path = settings_destination(SETTINGS_FILE_NAME, SETTINGS_PATH)
-    atomic_write_json(path, settings)
+    atomic_write_json(
+        path,
+        {key: config_path_text(value, base_directory=path.parent) if value else "" for key, value in settings.items()},
+    )
     return settings

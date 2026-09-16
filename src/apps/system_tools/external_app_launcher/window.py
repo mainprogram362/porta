@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from foundation import shared_launchers
-
 from apps.system_tools.program_launcher import ConfiguredProgramLauncherScreen
+from apps.system_tools.external_app_launcher import locations
 
 
 class ExternalAppLauncherScreen(ConfiguredProgramLauncherScreen):
@@ -22,13 +21,14 @@ class ExternalAppLauncherScreen(ConfiguredProgramLauncherScreen):
             ),
             settings_title="外部プログラムの位置",
             settings_warning=(
-                "外部プログラム置き場を1行に1つ書きます。"
-                "空欄なら何も探さず、登録していない場所を自動探索することもありません。"
+                "locations 配列へ外部プログラム置き場を書きます。"
+                "空配列なら何も探さず、登録していない場所を自動探索することもありません。"
             ),
-            load_locations=shared_launchers.load_external_locations,
-            editable_text=shared_launchers.external_editable_text,
-            template_text=shared_launchers.external_template_text,
-            save_text=shared_launchers.save_external_text,
+            load_locations=locations.load_external_locations,
+            editable_text=locations.external_editable_text,
+            template_text=locations.external_template_text,
+            validate_text=locations.validate_external_text,
+            save_text=locations.save_external_text,
         )
 
 

@@ -6,14 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foundation.json_settings import (
-    atomic_write_json,
-    create_app_settings_file,
-    editable_settings_text,
-    settings_destination,
-    validated_settings_status,
-)
-from foundation.path_tokens import expand_setting_path, home_tokenized
+from settings.json_settings import atomic_write_json, create_app_settings_file, editable_settings_text, settings_destination, validated_settings_status
+from settings.persistent_settings import config_path_text, resolve_config_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -36,7 +30,7 @@ def default_settings() -> dict[str, str]:
 
 def template_text() -> str:
     return json.dumps(
-        {key: home_tokenized(value) for key, value in default_settings().items()},
+        {key: config_path_text(value) if value else "" for key, value in default_settings().items()},
         ensure_ascii=False,
         indent=2,
     ) + "\n"
@@ -71,7 +65,7 @@ def validate_text(text: str) -> dict[str, str]:
             continue
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} は空でないパス文字列にしてください。")
-        result[key] = expand_setting_path(value.strip())
+        result[key] = resolve_config_path(value.strip())
     return result
 
 
@@ -98,7 +92,7 @@ def create_settings_file() -> Path:
 def save_text(text: str) -> dict[str, str]:
     """Atomically persist settings only after an explicit save action."""
     settings = validate_text(text)
-    saved = {key: home_tokenized(value) for key, value in settings.items()}
+    saved = {key: config_path_text(value) if value else "" for key, value in settings.items()}
     path = settings_destination(SETTINGS_FILE_NAME, SETTINGS_PATH)
     atomic_write_json(path, saved)
     return settings

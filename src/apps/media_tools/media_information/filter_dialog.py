@@ -120,7 +120,6 @@ class DetailedFilterDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("表示対象の詳細条件")
-        self.setMinimumSize(760, 420)
         self._fields = _field_choices(records)
         self._rows: list[_RuleRow] = []
         layout = QVBoxLayout(self)

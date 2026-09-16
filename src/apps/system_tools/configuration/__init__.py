@@ -1,3 +1,4 @@
-from .window import create_screen
-
-__all__ = ["create_screen"]
+"""Compatibility import for the relocated application."""
+import sys
+from importlib import import_module
+sys.modules[__name__] = import_module("apps.porta_control.configuration")

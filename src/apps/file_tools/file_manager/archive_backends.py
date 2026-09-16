@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime import managed_process
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -208,7 +210,7 @@ class SevenZipStandaloneBackend(ArchiveBackend):
             expected_hash = str(manifest["sha256"])
             if actual_hash != expected_hash:
                 return BackendAvailability(False, "同梱7zzsの整合性検査に失敗しました。")
-            probe = subprocess.run(
+            probe = managed_process.run(
                 [str(executable), "-h"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -216,6 +218,7 @@ class SevenZipStandaloneBackend(ArchiveBackend):
                 check=False,
                 timeout=10,
                 env=_tool_environment(),
+                label='7-Zip',
             )
             if probe.returncode != 0:
                 detail = probe.stderr.decode("utf-8", errors="replace").strip()
@@ -498,7 +501,7 @@ def _run_in_password_terminal(
     captured = bytearray()
     prompt_tail = ""
     try:
-        process = subprocess.Popen(
+        process = managed_process.popen(
             [str(executable), *arguments],
             stdin=slave_fd,
             stdout=slave_fd,
@@ -506,6 +509,7 @@ def _run_in_password_terminal(
             close_fds=True,
             start_new_session=True,
             env=_tool_environment(),
+            label='7-Zip',
         )
         os.close(slave_fd)
         slave_fd = -1

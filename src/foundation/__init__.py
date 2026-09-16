@@ -9,14 +9,9 @@ from .filesystem import (
     move_to_garbage,
     read_lines,
 )
-from .process import run_command
+from runtime.process import run_command
 from .power_status import PowerStatus, read_power_status
-from .user_space import (
-    UserSpacePaths,
-    configured_paths,
-    create_configured_directories,
-    paths_for_root,
-)
+from settings.user_space import UserSpacePaths, configured_paths, create_configured_directories, paths_for_root
 from .path import (
     PathLike,
     absolute_path,

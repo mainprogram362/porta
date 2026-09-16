@@ -222,11 +222,11 @@ def _validate_output_location(sources: tuple[Path, ...], destination: Path) -> N
 
 
 def _clean_archive_name(value: str) -> str:
-    name = value.strip()
+    name = value
     lowered = name.casefold()
     for suffix in (".7z", ".zip"):
         if lowered.endswith(suffix):
-            name = name[: -len(suffix)].rstrip()
+            name = name[: -len(suffix)]
             break
     if not name or name in {".", ".."}:
         raise ValueError("圧縮ファイル名を入力してください。")

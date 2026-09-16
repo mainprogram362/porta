@@ -2,39 +2,68 @@
 
 from __future__ import annotations
 
+from settings.persistent_settings import bootstrap_editable_text, bootstrap_template_text, locate_settings_directory, save_bootstrap_text, validate_bootstrap_text
 from collections.abc import Callable
 
-from foundation.persistent_settings import (
-    DEFAULT_USER_ROOT,
-    configured_user_root_text,
-    save_user_root_path,
-)
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QLineEdit, QMessageBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QMessageBox, QVBoxLayout, QWidget
+
+from .json_settings_editor import JsonFieldSpec, JsonSettingsEditor
+from .layout_policy import preferred_window_size
 
 
-def show_settings_location_editor(parent: QWidget) -> None:
+def show_settings_location_editor(
+    parent: QWidget,
+    *,
+    allow_save: Callable[[], bool] | None = None,
+) -> None:
     dialog = QDialog(parent)
     dialog.setWindowTitle("永続設定の保存先入口")
-    dialog.setMinimumSize(640, 180)
+    dialog.resize(preferred_window_size(dialog))
     layout = QVBoxLayout(dialog)
-    layout.addWidget(
-        QLabel(
-            "PORTA直下の案内札には、ユーザー領域の絶対パスまたは案内札基準の相対パスを"
-            "1つだけ保存します。設定は常に、そのユーザー領域の config/ から読みます。"
-        )
+    explanation = QLabel(
+        "PORTA直下のJSON入口設定には、ユーザー領域のパスを1つだけ保存します。"
+        "@PORTA、@HOME、相対パス、絶対パスを使えます。設定は常に、そのユーザー領域の config/ から読みます。"
     )
-    editor = QLineEdit(configured_user_root_text() or DEFAULT_USER_ROOT)
-    editor.setPlaceholderText("例: porta_user / ../porta_user / /任意の場所/porta_user")
-    layout.addWidget(editor)
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+    editor = JsonSettingsEditor(
+        validate=validate_bootstrap_text,
+        path_keys={"user_root"},
+        fields={
+            "user_root": JsonFieldSpec(
+                "porta_userの場所",
+                "PORTAが設定・AI・辞書などを探すユーザー領域です。@PORTA、@HOME、相対パス、絶対パスを使えます。",
+            )
+        },
+    )
+    original_text = bootstrap_editable_text()
+    editor.setPlainText(original_text)
+    source = locate_settings_directory()
+    # This editor establishes the user-root location itself, so it must stay
+    # editable even when that location is missing or invalid.
+    editor.set_source_state(source.state, source.detail, lock_unavailable=False)
+    layout.addWidget(editor, 1)
     buttons = QDialogButtonBox()
     template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
+    editor.bind_edit_button(template)
     save = buttons.addButton("入口を保存", QDialogButtonBox.ButtonRole.AcceptRole)
+    editor.bind_save_button(save)
     close = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
-    template.clicked.connect(lambda: editor.setText(DEFAULT_USER_ROOT))
+    template.clicked.connect(lambda: editor.setPlainText(bootstrap_template_text()))
 
     def save_entry() -> None:
+        if allow_save is not None and not allow_save():
+            return
+        if bootstrap_editable_text() != original_text:
+            QMessageBox.warning(
+                dialog,
+                "入口を保存できません",
+                "この画面を開いた後に、別の画面で保存先入口が変更されました。"
+                "現在の入力は保存していません。画面を閉じて、最新の設定から開き直してください。",
+            )
+            return
         try:
-            save_user_root_path(editor.text())
+            save_bootstrap_text(editor.toPlainText())
         except ValueError as exc:
             QMessageBox.warning(dialog, "入口を保存できません", str(exc))
             return
@@ -44,13 +73,3 @@ def show_settings_location_editor(parent: QWidget) -> None:
     close.clicked.connect(dialog.reject)
     layout.addWidget(buttons)
     dialog.exec()
-
-
-def create_app_settings_file(parent: QWidget, create: Callable[[], object]) -> None:
-    """Run only an explicit setup action and turn setup failures into UI text."""
-    try:
-        create()
-    except (OSError, ValueError) as exc:
-        QMessageBox.warning(parent, "設定を作成できません", str(exc))
-        return
-    QMessageBox.information(parent, "設定を作成しました", "設定保存先フォルダと、このアプリの雛形設定を確認しました。")

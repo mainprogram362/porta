@@ -21,8 +21,10 @@ def test_app_header_keeps_common_actions_around_screen_specific_content():
 
         assert header.back_button.text() == "← メインメニュー"
         assert header.settings_button is not None
-        assert header.settings_button.text() == "永続設定"
+        assert header.settings_button.text() == "⚙"
+        assert header.settings_button.accessibleName() == "永続設定"
         assert header.settings_button.toolTip() == "設定の説明"
+        assert header.settings_button.size().width() == header.settings_button.size().height() == 34
         assert header.title_label is not None
         assert header.title_label.text() == "画面名"
         assert header.title_label.objectName() == "app_page_title"
@@ -58,3 +60,23 @@ def test_app_header_can_omit_settings_for_screens_without_persistent_settings():
         assert header.settings_button is None
     finally:
         header.close()
+
+
+def test_hosted_header_moves_settings_and_keeps_screen_specific_controls():
+    from gui.wrapping_toolbar import WrappingToolBar
+    app = QApplication.instance() or QApplication([])
+    calls = []
+    host = QWidget()
+    toolbar = WrappingToolBar("作業", host)
+    header = AppHeader(lambda: calls.append("back"), title="機能名", on_settings=lambda: calls.append("settings"))
+    extra = QLabel("機能固有の設定")
+    header.content_layout.addWidget(extra)
+    header.use_work_toolbar(toolbar)
+    assert header.back_button.isHidden()
+    assert header.title_label.isHidden()
+    assert header.content_layout.indexOf(extra) >= 0
+    header.settings_button.click()
+    assert calls == ["settings"]
+    assert header.settings_button.parentWidget() is toolbar._content
+    header.close()
+    host.close()

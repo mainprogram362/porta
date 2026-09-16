@@ -50,7 +50,6 @@ def _show_expanded_value(parent: QDialog, *, label: str, value: str) -> QDialog:
     """Show one untruncated value in a selectable, resizable reader."""
     dialog = QDialog(parent)
     dialog.setWindowTitle(f"詳細値: {label}")
-    dialog.setMinimumSize(680, 440)
     layout = QVBoxLayout(dialog)
     layout.addWidget(QLabel(label))
     text = QPlainTextEdit(value)
@@ -74,7 +73,6 @@ def show_detached_item_details(item: MediaItem) -> QDialog:
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
     dialog.setModal(False)
     dialog.setWindowTitle("詳細項目（読み取り専用）")
-    dialog.setMinimumSize(760, 520)
     layout = QVBoxLayout(dialog)
     layout.addWidget(QLabel("対象パス（確認用。JSONには保存しません）"))
     path_input = QLineEdit(str(item.path) if item.path is not None else "仮登録（実在パスなし）")
@@ -90,9 +88,10 @@ def show_detached_item_details(item: MediaItem) -> QDialog:
     table.horizontalHeader().setStretchLastSection(False)
     table.horizontalHeader().setSectionResizeMode(0, table.horizontalHeader().ResizeMode.Stretch)
     table.horizontalHeader().setSectionResizeMode(1, table.horizontalHeader().ResizeMode.Stretch)
-    table.setColumnWidth(2, 100)
-    table.setColumnWidth(3, 100)
-    table.setColumnWidth(4, 260)
+    for column in (2, 3, 4):
+        table.horizontalHeader().setSectionResizeMode(
+            column, table.horizontalHeader().ResizeMode.ResizeToContents
+        )
     rows = editable_attribute_rows(item)
     table.setRowCount(len(rows))
     for row_index, values in enumerate(rows):

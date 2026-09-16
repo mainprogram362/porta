@@ -3,6 +3,6 @@ black==26.5.1
 isort==8.0.1
 ruff==0.16.3
 flake8==7.3.0
-pytest==7.4.2
+-r requirements-test.lock
 pytest-cov==4.1.0
 autoflake==2.3.3

@@ -190,11 +190,12 @@ def overwrite_safety_report(
     return True, "\n".join(lines)
 
 
-def catalog_value(item: MediaItem, key: str) -> str:
+
+def catalog_value(item: MediaItem, key: str, *, precise_highlights: bool = False) -> str:
     """Return the display value of one output attribute, including blanks."""
     return next(
         (
-            display_catalog_attribute(attribute)
+            display_catalog_attribute(attribute, precise_highlights=precise_highlights)
             for attribute in catalog_attributes_from_media_item(item)
             if attribute.key == key
         ),
@@ -277,6 +278,27 @@ def mpv_time_text(seconds: float) -> str:
     minutes, seconds_part = divmod(remainder, 60)
     return f"{hours}:{minutes:02d}:{seconds_part:02d}" if hours else f"{minutes:02d}:{seconds_part:02d}"
 
+
+
+def mpv_precise_time_text(seconds: float) -> str:
+    """Format an mpv position to milliseconds for durable highlight storage."""
+    total_milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds_part, milliseconds = divmod(remainder, 1000)
+    base = (
+        f"{hours}:{minutes:02d}:{seconds_part:02d}"
+        if hours
+        else f"{minutes:02d}:{seconds_part:02d}"
+    )
+    return f"{base}.{milliseconds:03d}"
+
+
+def mpv_highlight_time_text(beginning: float, end: float) -> str:
+    """Store a zero-length mpv range as a point, otherwise as a range."""
+    start_text = mpv_precise_time_text(beginning)
+    end_text = mpv_precise_time_text(end)
+    return start_text if start_text == end_text else f"{start_text}-{end_text}"
 
 def editable_attribute_rows(item: MediaItem) -> tuple[tuple[str, str, str, str, str], ...]:
     """Build a stable, read-only table model for the detached details window."""

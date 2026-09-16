@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from foundation.path import normalize_path
+from foundation.path import normalize_path, path_text_from_input
 
 SearchMode = Literal["contains", "regex"]
 ItemKind = Literal["all", "file", "directory"]
@@ -101,9 +101,9 @@ def search_direct_children_from_roots(
     """Search immediate children of every listed directory, in input order."""
     roots = tuple(
         dict.fromkeys(
-            normalize_path(line.strip())
+            normalize_path(path_text_from_input(line))
             for line in roots_text.splitlines()
-            if line.strip()
+            if line
         )
     )
     if not roots:
@@ -158,9 +158,9 @@ def search_skip_two_levels_from_roots(
     """Search only items at depth two, ignoring every direct child of each root."""
     roots = tuple(
         dict.fromkeys(
-            normalize_path(line.strip())
+            normalize_path(path_text_from_input(line))
             for line in roots_text.splitlines()
-            if line.strip()
+            if line
         )
     )
     if not roots:

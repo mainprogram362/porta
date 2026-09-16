@@ -99,6 +99,9 @@ def test_file_manager_context_attribute_appears_in_path_menus(tmp_path, monkeypa
         line_chooser.actions()[0].trigger()
         assert dialog.destination_input.path() == tmp_path
     finally:
+        for dialog in tuple(screen._operation_confirmation_dialogs):
+            dialog.close()
+        QApplication.instance().processEvents()
         screen.close()
 
 

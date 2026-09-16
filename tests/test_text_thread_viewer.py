@@ -31,7 +31,8 @@ def test_viewer_loads_threads_searches_across_them_and_expands_replies(tmp_path)
         screen.load_texts()
 
         assert screen.thread_combo.count() == 3
-        assert "3 スレッドを読み込みました。" in screen.status_label.text()
+        assert screen.status_label.isHidden()
+        assert screen.source_box.isHidden()
         assert "[1]" in screen.reply_browser.toPlainText()
 
         screen.search_input.setText("検索語")
@@ -58,10 +59,10 @@ def test_viewer_loads_threads_searches_across_them_and_expands_replies(tmp_path)
         assert "このスレッド 1件 / 全3件" == screen.search_info_label.text()
 
         screen._toggle_expanded_viewer()
-        assert screen.setup_widget.isHidden()
-        assert screen.source_box.isHidden()
-        screen._toggle_expanded_viewer()
         assert not screen.source_box.isHidden()
+        assert not screen.setup_widget.isHidden()
+        screen._toggle_expanded_viewer()
+        assert screen.source_box.isHidden()
 
         screen._open_search_results_window()
         result_window = next(window for window in screen.findChildren(QDialog) if window.isVisible())

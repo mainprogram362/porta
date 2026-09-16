@@ -11,10 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foundation.path import absolute_path
-from foundation.path_tokens import expand_setting_path
-from foundation.json_settings import atomic_write_json, create_app_settings_file, settings_destination
-from foundation.persistent_settings import settings_file_status
+from settings.json_settings import atomic_write_json, create_app_settings_file, settings_destination
+from settings.persistent_settings import config_path_text, resolve_config_path, settings_file_status
 
 
 SETTINGS_FILE_NAME = "storage_encryption.json"
@@ -146,6 +144,22 @@ def save_text(text: str) -> StorageEncryptionSettings:
     path = settings_destination(SETTINGS_FILE_NAME, SETTINGS_PATH)
     settings = validate_text(text, base_directory=path.parent)
     raw = json.loads(text)
+    raw["container_favorites"] = [
+        config_path_text(value, base_directory=path.parent) if value.strip() else ""
+        for value in raw["container_favorites"]
+    ]
+    raw["mount_point_favorites"] = [
+        config_path_text(value, base_directory=path.parent) if value.strip() else ""
+        for value in raw["mount_point_favorites"]
+    ]
+    for preset in raw["mount_presets"]:
+        if preset["container_path"].strip():
+            preset["container_path"] = config_path_text(
+                preset["container_path"], base_directory=path.parent
+            )
+            preset["mount_point"] = config_path_text(
+                preset["mount_point"], base_directory=path.parent
+            )
     atomic_write_json(path, raw)
     return settings
 
@@ -205,12 +219,7 @@ def _validate_presets(value: Any, base_directory: Path | None) -> tuple[MountPre
 
 
 def _expand_path(value: str, label: str, base_directory: Path | None) -> str:
-    expanded = expand_setting_path(value)
-    if "\x00" in expanded:
-        raise ValueError(f"{label} にNUL文字は使えません。")
-    candidate = Path(expanded)
-    if not candidate.is_absolute():
-        if base_directory is None:
-            raise ValueError(f"{label} の相対パスを解釈する設定JSONの基準フォルダがありません。")
-        candidate = base_directory / candidate
-    return str(absolute_path(candidate))
+    try:
+        return resolve_config_path(value, base_directory=base_directory)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from exc

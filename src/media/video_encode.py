@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime import managed_process
+
 from collections.abc import Iterable
 from dataclasses import dataclass
 import json
@@ -31,6 +33,14 @@ _ENCODE_BACKEND_LABELS: dict[EncodeBackendKey, str] = {
     "intel_qsv": "Intel Quick Sync",
     "vaapi": "VA-API（Intel / AMD）",
 }
+_NVIDIA_ENCODERS: dict[CodecKey, str] = {
+    "h264": "h264_nvenc",
+    "hevc": "hevc_nvenc",
+    "av1": "av1_nvenc",
+}
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_BUNDLED_TOOL_DIRECTORY = _PROJECT_ROOT / "integrated_backends" / "ffmpeg" / "bin"
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,7 @@ class VideoEncodeRequest:
     target_size_mib: int | None = None
     edit_rules: tuple["VideoEditRule", ...] = ()
     encode_backend: EncodeBackendKey = "software"
+    sample_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,7 @@ class KeyframeCut:
 class PlannedEncode:
     source: Path
     output: Path
+    temporary_output: Path
     command: tuple[str, ...]
     keyframe_cut: KeyframeCut | None = None
     notes: tuple[str, ...] = ()
@@ -113,12 +125,32 @@ class VideoEncodePreview:
 
 
 def discover_tools() -> FFmpegTools:
-    """Find and validate the PATH-selected FFmpeg pair without changing files."""
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        raise ValueError("PATHから ffmpeg と ffprobe の両方を見つけられません。")
-    return validate_tools(ffmpeg, ffprobe)
+    """Find one valid FFmpeg pair, preferring PORTA's private backend copy."""
+    candidates: list[tuple[str, str | Path, str | Path]] = [
+        (
+            "PORTA内バックエンド",
+            _BUNDLED_TOOL_DIRECTORY / "ffmpeg",
+            _BUNDLED_TOOL_DIRECTORY / "ffprobe",
+        )
+    ]
+    system_ffmpeg = shutil.which("ffmpeg")
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffmpeg and system_ffprobe:
+        candidates.append(("パソコン本体のPATH", system_ffmpeg, system_ffprobe))
+
+    failures: list[str] = []
+    for source, ffmpeg, ffprobe in candidates:
+        try:
+            return validate_tools(ffmpeg, ffprobe)
+        except ValueError as exc:
+            failures.append(f"{source}: {exc}")
+
+    detail = "\n".join(failures)
+    raise ValueError(
+        "PORTA内バックエンドとパソコン本体のどちらにも、使える "
+        "ffmpeg / ffprobe の組を見つけられません。パスを手入力してください。"
+        + (f"\n{detail}" if detail else "")
+    )
 
 
 def validate_tools(ffmpeg_value: str | Path, ffprobe_value: str | Path) -> FFmpegTools:
@@ -129,14 +161,61 @@ def validate_tools(ffmpeg_value: str | Path, ffprobe_value: str | Path) -> FFmpe
         if not path.is_file() or not path.stat().st_mode & 0o111:
             raise ValueError(f"{label} の実行ファイルを確認できません: {path}")
         try:
-            result = subprocess.run(
-                [str(path), "-version"], capture_output=True, text=True, check=False, timeout=8
+            result = managed_process.run(
+                [str(path), "-version"], capture_output=True, text=True, check=False, timeout=8,
+                label='FFmpeg・動画情報の確認',
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ValueError(f"{label} を実行できません: {path}") from exc
         if result.returncode != 0:
             raise ValueError(f"{label} は -version に正常応答しません: {path}")
     return FFmpegTools(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+
+def validate_encode_backend(tools: FFmpegTools, request: VideoEncodeRequest) -> None:
+    """Prove a selected hardware encoder can run without touching user files."""
+    if request.encode_backend == "software":
+        return
+    if request.encode_backend != "nvidia_nvenc":
+        raise ValueError("このGPU方式はまだ実装していません。CPUまたはNVIDIA NVENCを選んでください。")
+    if request.encode_mode != "reencode":
+        raise ValueError("高速キーフレームカットは再エンコードしないため、GPU方式を使えません。")
+    encoder = _NVIDIA_ENCODERS[request.codec]
+    try:
+        listed = managed_process.run(
+            [str(tools.ffmpeg), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+            label='FFmpeg・動画情報の確認',
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("FFmpegのNVIDIA対応を確認できません。") from exc
+    if listed.returncode != 0 or encoder not in listed.stdout:
+        raise ValueError(f"このFFmpegには {encoder} が含まれていません。CPU方式を選んでください。")
+
+    # A listed encoder alone is insufficient: the driver, GPU generation, and
+    # permissions can still reject it. This encodes one generated frame only;
+    # it reads no user file and creates no output file.
+    command = (
+        str(tools.ffmpeg), "-hide_banner", "-nostdin", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=1", "-frames:v", "1",
+        "-an", "-c:v", encoder, "-f", "null", "-",
+    )
+    try:
+        tested = managed_process.run(
+            command, capture_output=True, text=True, check=False, timeout=20,
+            label='FFmpeg・動画情報の確認',
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("NVIDIA NVENCの実機テストを実行できません。") from exc
+    if tested.returncode != 0:
+        detail = tested.stderr.strip() or tested.stdout.strip()
+        raise ValueError(
+            "NVIDIA NVENCの実機テストに失敗しました。GPUドライバ・GPU対応・利用権限を確認してください。"
+            + (f"\n{detail[-1500:]}" if detail else "")
+        )
 
 
 def build_encode_preview(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoEncodePreview:
@@ -176,9 +255,12 @@ def build_encode_preview(tools: FFmpegTools, request: VideoEncodeRequest) -> Vid
             else "出力先: 各動画と同じフォルダへ保存"
         ),
         "出力: MP4、新しいファイルのみ作成。元ファイルは削除しません。",
+        "変換中は【PORTA変換中・未確認】付きの名前で保存し、成功時だけ完成名へ変更します。",
         "",
         "変更予定:",
     ]
+    if request.sample_seconds is not None:
+        lines.append(f"試し変換: 編集後の先頭{request.sample_seconds}秒まで。通常出力とは別の名前で保存します。")
     if request.encode_mode == "reencode" and request.edit_rules:
         lines.insert(-1, "編集内容: " + " / ".join(_edit_rule_summary(rule) for rule in request.edit_rules))
     for index, item in enumerate(plan.items, 1):
@@ -201,17 +283,17 @@ def build_encode_plan(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoE
     """Validate inputs and create non-overwriting FFmpeg commands."""
     if not request.sources:
         raise ValueError("動画ファイルを1件以上追加し、対象にチェックしてください。")
+    if request.sample_seconds is not None:
+        if type(request.sample_seconds) is not int or not 1 <= request.sample_seconds <= 60:
+            raise ValueError("試し変換は1〜60秒で指定してください。")
+        if request.encode_mode != "reencode" or request.target_size_mib is not None:
+            raise ValueError("試し変換は再エンコード・サイズ指定なしで使用してください。")
     if request.output_mode not in {"specified_directory", "alongside_source"}:
         raise ValueError("未対応の出力方式です。")
     if request.encode_mode not in {"reencode", "keyframe_cut"}:
         raise ValueError("未対応のエンコード方式です。")
     if request.encode_backend not in _ENCODE_BACKEND_LABELS:
         raise ValueError("未対応のエンコード実行装置です。")
-    if request.encode_backend != "software":
-        raise ValueError(
-            "GPU方式は事前テスト機能をまだ接続していないため使用できません。"
-            "現在はCPU方式を選んでください。"
-        )
     if request.output_mode == "specified_directory" and request.output_directory is None:
         raise ValueError("まとめて出力する場合は、出力先フォルダを入力してください。")
     if request.output_mode == "specified_directory" and not request.output_directory.is_dir():
@@ -220,6 +302,8 @@ def build_encode_plan(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoE
         raise ValueError("未対応の映像コーデックです。")
     if not 0 <= request.crf <= 63:
         raise ValueError("品質（CRF）は 0〜63 で指定してください。")
+    if request.encode_backend == "nvidia_nvenc" and request.crf > 51:
+        raise ValueError("NVIDIA NVENCの品質（CQ）は 0〜51 で指定してください。")
     if request.trim_start_frames < 0:
         raise ValueError("先頭から削除するフレーム数は0以上にしてください。")
     if request.resize_mode not in {"fit", "stretch"}:
@@ -248,7 +332,10 @@ def build_encode_plan(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoE
             raise ValueError("高速キーフレームカットでは、通常の編集ルールを併用できません。")
         if request.resolution is not None or request.target_size_mib is not None:
             raise ValueError("高速キーフレームカットでは、解像度・サイズ指定を使えません。")
+    validate_encode_backend(tools, request)
     suffix = request.output_suffix.strip() or "_encoded"
+    if request.sample_seconds is not None:
+        suffix += f"_sample_{request.encode_backend}"
     if Path(suffix).name != suffix or suffix in {".", ".."}:
         raise ValueError("出力名末尾にはフォルダ区切りを含めず、名前の末尾だけを入力してください。")
 
@@ -264,6 +351,9 @@ def build_encode_plan(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoE
         )
         assert output_directory is not None
         output = _unique_output_path(output_directory, source.stem, suffix, occupied)
+        temporary_output = _temporary_output_path(output)
+        if temporary_output.exists():
+            raise ValueError(f"前回の未確認出力が残っています。確認または削除してから再実行してください: {temporary_output}")
         occupied.add(output)
         if request.encode_mode == "keyframe_cut":
             duration, keyframes = _probe_duration_and_keyframes(tools.ffprobe, source)
@@ -273,20 +363,20 @@ def build_encode_plan(tools: FFmpegTools, request: VideoEncodeRequest) -> VideoE
                 duration=duration,
                 keyframes=keyframes,
             )
-            planned.append(PlannedEncode(source=source, output=output, command=(), keyframe_cut=cut))
+            planned.append(PlannedEncode(source=source, output=output, temporary_output=temporary_output, command=(), keyframe_cut=cut))
             continue
         fps, has_audio = _probe_video_basics(tools.ffprobe, source)
         duration = _probe_duration(tools.ffprobe, source) if _request_needs_duration(request) else None
         command, notes = _build_command(
             tools.ffmpeg,
             source,
-            output,
+            temporary_output,
             request,
             fps=fps,
             has_audio=has_audio,
             duration=duration,
         )
-        planned.append(PlannedEncode(source=source, output=output, command=command, notes=notes))
+        planned.append(PlannedEncode(source=source, output=output, temporary_output=temporary_output, command=command, notes=notes))
     return VideoEncodePlan(tools=tools, request=request, items=tuple(planned))
 
 
@@ -302,10 +392,15 @@ def _unique_output_path(directory: Path, stem: str, suffix: str, occupied: set[P
         index += 1
 
 
+def _temporary_output_path(output: Path) -> Path:
+    """Keep incomplete outputs visible without occupying their final filename."""
+    return output.with_name(f"{output.stem}【PORTA変換中・未確認】{output.suffix}")
+
+
 def _probe_duration_and_keyframes(ffprobe: Path, source: Path) -> tuple[float, tuple[float, ...]]:
     """Read only video keyframes, needed to make stream-copy cuts explicit."""
     try:
-        result = subprocess.run(
+        result = managed_process.run(
             [
                 str(ffprobe), "-v", "error", "-skip_frame", "nokey", "-select_streams", "v:0",
                 "-show_frames", "-show_entries", "format=duration:frame=best_effort_timestamp_time,key_frame",
@@ -315,6 +410,7 @@ def _probe_duration_and_keyframes(ffprobe: Path, source: Path) -> tuple[float, t
             text=True,
             check=False,
             timeout=90,
+            label='FFmpeg・動画情報の確認',
         )
         data = json.loads(result.stdout) if result.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -386,14 +482,14 @@ def build_keyframe_cut_command(
         raise ValueError("キーフレームカットではない計画です。")
     return (
         str(tools.ffmpeg), "-hide_banner", "-nostdin", "-n", "-f", "concat", "-safe", "0",
-        "-i", str(concat_manifest), "-map", "0", "-map_metadata", "0", "-c", "copy", str(item.output),
+        "-i", str(concat_manifest), "-map", "0", "-map_metadata", "0", "-c", "copy", str(item.temporary_output),
     )
 
 
 def _probe_video_basics(ffprobe: Path, source: Path) -> tuple[float, bool]:
     """Read only the first video stream's average frame rate and audio presence."""
     try:
-        result = subprocess.run(
+        result = managed_process.run(
             [
                 str(ffprobe), "-v", "error", "-show_entries", "stream=codec_type,avg_frame_rate",
                 "-of", "json", str(source),
@@ -402,6 +498,7 @@ def _probe_video_basics(ffprobe: Path, source: Path) -> tuple[float, bool]:
             text=True,
             check=False,
             timeout=20,
+            label='FFmpeg・動画情報の確認',
         )
         data = json.loads(result.stdout) if result.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
@@ -420,12 +517,13 @@ def _probe_video_basics(ffprobe: Path, source: Path) -> tuple[float, bool]:
 def _probe_duration(ffprobe: Path, source: Path) -> float:
     """Read duration only when a rule or size calculation actually needs it."""
     try:
-        result = subprocess.run(
+        result = managed_process.run(
             [str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(source)],
             capture_output=True,
             text=True,
             check=False,
             timeout=20,
+            label='FFmpeg・動画情報の確認',
         )
         data = json.loads(result.stdout) if result.returncode == 0 else {}
         raw = data.get("format", {}).get("duration") if isinstance(data, dict) else None
@@ -485,6 +583,9 @@ def _build_command(
     duration: float | None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     encoder, _label = _CODECS[request.codec]
+    uses_nvenc = request.encode_backend == "nvidia_nvenc"
+    if uses_nvenc:
+        encoder = _NVIDIA_ENCODERS[request.codec]
     command: list[str] = [str(ffmpeg), "-hide_banner", "-nostdin", "-n", "-i", str(source)]
     normalized_rules, notes = _normalized_edit_rules(
         request.edit_rules, fps=fps, duration=duration, trim_start_frames=request.trim_start_frames
@@ -509,7 +610,10 @@ def _build_command(
         command.extend(["-map", "0:v:0", "-map", "0:a?"])
     command.extend(["-map_metadata", "0", "-c:v", encoder])
     if request.target_size_mib is None:
-        command.extend(["-crf", str(request.crf)])
+        if uses_nvenc:
+            command.extend(["-rc", "vbr", "-cq", str(request.crf)])
+        else:
+            command.extend(["-crf", str(request.crf)])
     else:
         assert duration is not None
         video_bitrate = _target_video_bitrate(
@@ -518,10 +622,14 @@ def _build_command(
             request.audio_bitrate_kbps,
         )
         command.extend(["-b:v", str(video_bitrate)])
-    if request.codec in {"h264", "hevc"}:
+    if uses_nvenc:
+        command.extend(["-preset", "p4"])
+    elif request.codec in {"h264", "hevc"}:
         command.extend(["-preset", "medium"])
     if has_audio:
         command.extend(["-c:a", "aac", "-b:a", f"{request.audio_bitrate_kbps}k"])
+    if request.sample_seconds is not None:
+        command.extend(["-t", str(request.sample_seconds)])
     command.append(str(output))
     return tuple(command), notes
 

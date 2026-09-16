@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime.runtime_activity import runtime_activity
+
 import os
 from pathlib import Path
 import shutil
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from foundation.path import path_entry_exists
 from gui import PathLineInput
+from gui.layout_policy import set_text_rows
 
 from .archive_backends import (
     ArchiveCommandCancelled,
@@ -69,6 +72,7 @@ class ArchiveInspectionThread(QThread):
     def request_cancel(self) -> None:
         self._cancel_requested.set()
 
+    @runtime_activity('圧縮ファイルを確認・解凍中')
     def run(self) -> None:
         try:
             backend = select_archive_backend(self._plan.backend_id)
@@ -140,6 +144,7 @@ class CooperativeExtractThread(QThread):
             self._condition.notify_all()
         self._set_process_paused(False)
 
+    @runtime_activity('圧縮ファイルを確認・解凍中')
     def run(self) -> None:
         try:
             revalidate_extract_plan(self._plan)
@@ -289,7 +294,6 @@ class ArchiveContentsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"個別ファイル展開：{archive.name}")
-        self.setMinimumSize(720, 520)
         self.request_extract = False
         layout = QVBoxLayout(self)
         explanation = QLabel(
@@ -319,9 +323,10 @@ class ArchiveContentsDialog(QDialog):
         self.members_tree.setHeaderLabels(
             ("解凍", "種別", "展開後サイズ", "アーカイブ内パス")
         )
-        self.members_tree.setColumnWidth(0, 54)
-        self.members_tree.setColumnWidth(1, 86)
-        self.members_tree.setColumnWidth(2, 120)
+        members_header = self.members_tree.header()
+        for column in (0, 1, 2):
+            members_header.setSectionResizeMode(column, members_header.ResizeMode.ResizeToContents)
+        members_header.setSectionResizeMode(3, members_header.ResizeMode.Stretch)
         selected_values = set(selected) if selected is not None else None
         for member in members:
             path = str(getattr(member, "path", ""))
@@ -400,7 +405,6 @@ class QuickExtractDialog(QDialog):
     def __init__(self, archives: tuple[Path, ...], destination_text: str = "") -> None:
         super().__init__(None)
         self.setWindowTitle(f"圧縮ファイルを解凍（{len(archives)}件）")
-        self.setMinimumSize(740, 640)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._archives = archives
         self._plan: ExtractPlan | None = None
@@ -431,7 +435,7 @@ class QuickExtractDialog(QDialog):
         archives_header.addWidget(self.contents_button)
         layout.addLayout(archives_header)
         self.archives_list = QListWidget()
-        self.archives_list.setMaximumHeight(120)
+        set_text_rows(self.archives_list, minimum=2, maximum=5)
         for archive in archives:
             item = QListWidgetItem(archive.name)
             item.setData(Qt.ItemDataRole.UserRole, str(archive))
@@ -494,7 +498,7 @@ class QuickExtractDialog(QDialog):
         layout.addLayout(inspection_header)
         self.inspection_text = QTextEdit()
         self.inspection_text.setReadOnly(True)
-        self.inspection_text.setMinimumHeight(150)
+        set_text_rows(self.inspection_text, minimum=7)
         self.inspection_text.setPlainText("同梱7-Zipでパスワードが必要かを確認します…")
         layout.addWidget(self.inspection_text, 1)
 
@@ -595,7 +599,7 @@ class QuickExtractDialog(QDialog):
         destination = (
             f"{archive.parent} 内の「{archive.stem}」フォルダ"
             if self.in_place_checkbox.isChecked()
-            else self.destination_input.text().strip() or "未入力"
+            else self.destination_input.text() or "未入力"
         )
         dialog = ArchiveContentsDialog(
             archive,

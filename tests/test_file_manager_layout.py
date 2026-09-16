@@ -7,19 +7,61 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QPushButton, QScrollArea
 
 from apps.file_tools.file_manager import FileManagerScreen
+from gui import AppHeader
 
 
-def test_file_manager_uses_fixed_grid_panes_without_outer_scrollers():
+def test_file_manager_keeps_navigation_header_out_of_the_workspace_controls():
+    app = QApplication.instance() or QApplication([])
+    screen = FileManagerScreen(lambda: None)
+    try:
+        screen.show()
+        app.processEvents()
+        assert not screen.findChildren(AppHeader)
+        assert screen.persistent_settings_button.parentWidget() is screen.favorites_box
+        controls = [
+            screen.edit_controls.layout().itemAt(index).widget()
+            for index in range(screen.edit_controls.layout().count())
+        ]
+        assert controls[0] is screen.undo_button
+        assert controls[1] is screen.redo_button
+        assert screen.edit_controls.parentWidget() is screen.operation_box
+        assert screen.execution_controls.isHidden()
+        operation_buttons = {
+            button.text() for button in screen.operation_box.findChildren(QPushButton)
+        }
+        assert "プレビュー・実行…" in operation_buttons
+        assert "結果を見る" not in operation_buttons
+    finally:
+        screen.close()
+
+
+def test_undo_history_is_bounded_and_does_not_change_current_paths():
+    QApplication.instance() or QApplication([])
+    screen = FileManagerScreen(lambda: None)
+    try:
+        for index in range(65):
+            screen.search_results_input.setPlainText(f"/example/path-{index}")
+        assert len(screen._undo_states) == 51
+        assert screen.search_results_input.toPlainText() == "/example/path-64"
+        assert all("_memory_cost" in state for state in screen._undo_states)
+    finally:
+        screen.close()
+
+
+def test_file_manager_keeps_execution_outside_scrollable_panes():
     app = QApplication.instance() or QApplication([])
     screen = FileManagerScreen(lambda: None)
     try:
         screen.resize(1000, 760)
         screen.show()
         app.processEvents()
-        assert screen.minimumSize().width() == 1020
-        assert not screen.findChildren(QScrollArea)
-        assert screen._workspace_layout.itemAtPosition(0, 0).widget() is screen.favorites_box
-        assert screen._workspace_layout.itemAtPosition(0, 1).widget() is screen.search_results_box
+        assert screen.width() == 1000
+        assert screen.minimumSize().width() <= 800
+        assert screen._panes_scroll.widget() is screen._panes_splitter
+        assert not screen._panes_scroll.isAncestorOf(screen.execution_bar)
+        assert not screen._panes_scroll.isAncestorOf(screen.state_bar)
+        assert screen._panes_splitter.widget(0) is screen.favorites_box
+        assert screen._work_splitter.widget(0) is screen.search_results_box
         assert screen._workspace_layout.itemAtPosition(1, 0).widget() is screen.execution_bar
         assert screen._workspace_layout.itemAtPosition(2, 0).widget() is screen.state_bar
         state_position = screen._workspace_layout.getItemPosition(
@@ -31,7 +73,7 @@ def test_file_manager_uses_fixed_grid_panes_without_outer_scrollers():
         assert screen.operation_box.parentWidget() is screen.execution_bar
         assert not hasattr(screen, "preview_sidebar")
         assert not hasattr(screen, "destination_line_input")
-        assert screen.copy_button.text() == "実行内容を確認…"
+        assert screen.copy_button.text() == "プレビュー・実行…"
     finally:
         screen.close()
 
@@ -47,23 +89,16 @@ def test_file_manager_uses_two_preparation_columns_for_one_to_one():
         assert screen.operation_summary_label.text().startswith("操作:")
         screen.copy_mode_combo.setCurrentIndex(1)  # 一対一コピー
         app.processEvents()
-        assert screen._workspace_layout.itemAtPosition(0, 0).widget() is screen.favorites_box
-        assert screen._workspace_layout.itemAtPosition(0, 1).widget() is screen.search_results_box
-        assert screen._workspace_layout.itemAtPosition(0, 2).widget() is screen.output_operation_box
+        assert screen._panes_splitter.widget(0) is screen.favorites_box
+        assert screen._work_splitter.widget(0) is screen.search_results_box
+        assert screen._work_splitter.widget(1) is screen.output_operation_box
         assert screen._workspace_layout.itemAtPosition(2, 0).widget() is screen.state_bar
         state_position = screen._workspace_layout.getItemPosition(
             screen._workspace_layout.indexOf(screen.state_bar)
         )
         assert state_position == (2, 0, 1, 3)
-        output_position = screen._workspace_layout.getItemPosition(
-            screen._workspace_layout.indexOf(screen.output_operation_box)
-        )
-        assert output_position == (0, 2, 1, 1)
-        assert [screen._workspace_layout.columnMinimumWidth(column) for column in range(3)] == [
-            120,
-            240,
-            240,
-        ]
+        assert screen._work_splitter.orientation() == Qt.Orientation.Horizontal
+        assert screen._work_splitter.handleWidth() > 0
         assert screen.operation_summary_label.isVisible()
         assert screen.readiness_label.isVisible()
         assert screen._workspace_layout.rowStretch(0) == 1
@@ -76,13 +111,17 @@ def test_file_manager_uses_two_preparation_columns_for_one_to_one():
         assert screen.output_operation_box.height() == screen.search_results_box.height()
         screen.copy_mode_combo.setCurrentIndex(0)  # 通常コピー
         app.processEvents()
-        assert screen._workspace_layout.itemAtPosition(0, 1).widget() is screen.search_results_box
+        assert screen._work_splitter.widget(0) is screen.search_results_box
         assert screen.output_operation_box.isHidden()
-        assert screen._workspace_layout.columnMinimumWidth(2) == 240
+        assert not screen._work_splitter.childrenCollapsible()
         screen.operation_combo.setCurrentIndex(4)  # リネーム
         app.processEvents()
-        assert screen._workspace_layout.itemAtPosition(0, 2).widget() is screen.rename_operation_box
-        assert screen._workspace_layout.columnMinimumWidth(2) == 240
+        assert screen._work_splitter.widget(2) is screen.rename_operation_box
+        assert screen.operation_box.parentWidget() is screen.execution_bar
+        assert screen.operation_stack.parentWidget() is screen.rename_operation_box
+        assert not screen.rename_operation_box.isAncestorOf(screen.copy_button)
+        assert screen.rename_operation_box.isAncestorOf(screen.rename_panel)
+        assert not screen._work_splitter.childrenCollapsible()
         assert "border" in screen.rename_operation_box.styleSheet()
     finally:
         screen.close()
@@ -151,7 +190,7 @@ def test_file_manager_uses_checks_without_a_separate_operation_target_control():
 
 
 def test_file_manager_confirmation_previews_only_checked_rows(tmp_path):
-    QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
     output = tmp_path / "output"
@@ -173,10 +212,13 @@ def test_file_manager_confirmation_previews_only_checked_rows(tmp_path):
         assert str(first) in dialog.preview_text.toPlainText()
         assert str(second) not in dialog.preview_text.toPlainText()
     finally:
+        for dialog in tuple(screen._operation_confirmation_dialogs):
+            dialog.close()
+        app.processEvents()
         screen.close()
 
 
-def test_file_manager_has_no_standalone_search_panel():
+def test_file_manager_has_no_legacy_search_panel():
     QApplication.instance() or QApplication([])
     screen = FileManagerScreen(lambda: None)
     try:
@@ -187,11 +229,12 @@ def test_file_manager_has_no_standalone_search_panel():
         assert "拡大" not in button_texts
         assert "メディア情報整理へ送る" not in button_texts
         assert "動画変換へ送る" not in button_texts
-        assert screen.rename_panel.add_rule_button.minimumWidth() == 96
+        assert screen.rename_panel.add_rule_button.minimumWidth() == 0
+        assert screen.rename_panel.add_rule_button.sizeHint().width() > 0
         screen.operation_combo.setCurrentIndex(4)
         screen.rename_panel.rule_kind_combo.setCurrentIndex(6)  # 文字列を置換
-        assert screen.rename_panel.text_input.minimumWidth() == 130
-        assert screen.rename_panel.replacement_input.minimumWidth() == 130
+        assert screen.rename_panel.text_input.minimumWidth() == 0
+        assert screen.rename_panel.replacement_input.minimumWidth() == 0
     finally:
         screen.close()
 
@@ -221,30 +264,12 @@ def test_file_manager_rename_panel_lists_live_before_and_after_names(tmp_path):
         screen.close()
 
 
-def test_file_manager_keeps_execution_results_only_in_memory_until_cleared():
-    QApplication.instance() or QApplication([])
-    screen = FileManagerScreen(lambda: None)
-    try:
-        assert not screen.results_button.isEnabled()
-        screen._record_execution_result("コピー完了", "1件")
-        screen._record_execution_result("ZIP作成完了", "2件")
-        assert screen.results_button.isEnabled()
-        screen.show_execution_results()
-        assert "コピー完了" in screen._results_text.toPlainText()
-        assert "ZIP作成完了" in screen._results_text.toPlainText()
-        screen.clear_execution_results()
-        assert not screen.results_button.isEnabled()
-        assert screen._execution_results == []
-    finally:
-        screen.close()
-
-
 def test_file_manager_places_direct_work_list_actions_at_the_top():
     QApplication.instance() or QApplication([])
     screen = FileManagerScreen(lambda: None)
     try:
         button_texts = {button.text() for button in screen.search_results_box.findChildren(QPushButton)}
-        assert {"一覧を空にする", "全件チェック", "全チェック解除", "条件で選別 ▸"} <= button_texts
+        assert {"一覧整理", "チェック", "条件で選別 ▸"} <= button_texts
         assert "全対象" not in button_texts
         assert "全対象解除" not in button_texts
     finally:
@@ -286,8 +311,11 @@ def test_file_manager_favorites_width_is_reduced_to_three_fifths_of_previous_spa
         screen.resize(1020, 720)
         screen.show()
         app.processEvents()
-        assert screen.favorites_box.width() == 168
-        assert screen.favorites_box.maximumWidth() == 168
+        assert screen.favorites_box.width() >= 120
+        before = screen.favorites_box.width()
+        screen._panes_splitter.setSizes([before + 80, 600])
+        app.processEvents()
+        assert screen.favorites_box.width() > before
     finally:
         screen.close()
 

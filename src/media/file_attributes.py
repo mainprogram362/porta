@@ -8,6 +8,8 @@ file; callers may convert stable observations into an explicit catalog update.
 
 from __future__ import annotations
 
+from runtime import managed_process
+
 import json
 import mimetypes
 import os
@@ -540,6 +542,59 @@ def append_media_highlight(item: MediaItem, *, time: str, comment: str = "") -> 
     return _replace_media_highlights(item, values)
 
 
+
+def append_mpv_highlight_replacing_overlaps(
+    item: MediaItem, *, time: str, comment: str = ""
+) -> tuple[MediaItem, int]:
+    """Add an mpv highlight and replace prior highlights occupying its time.
+
+    A point represents its displayed second and the following second.  Thus a
+    one-second correction replaces the prior point, while ranges use their
+    inclusive displayed bounds.  This helper is deliberately for transient
+    mpv input only; normal catalog editing never removes highlights implicitly.
+    """
+    highlight = _normalized_highlight({"time": time, "comment": comment})
+    beginning, end = _highlight_interval_seconds(highlight["time"])
+    existing = item.attribute_map.get("media.highlights")
+    values = _normalized_highlights(existing.value if existing is not None else [])
+    retained = [
+        value
+        for value in values
+        if not _highlight_intervals_overlap(
+            beginning, end, *_highlight_interval_seconds(value["time"])
+        )
+    ]
+    removed = len(values) - len(retained)
+    if highlight not in retained:
+        retained.append(highlight)
+    return _replace_media_highlights(item, retained), removed
+
+
+
+def _highlight_interval_seconds(value: str) -> tuple[float, float]:
+    """Return an inclusive interval for one validated highlight time."""
+    start_text, separator, end_text = value.partition("-")
+    start = _highlight_timestamp_seconds(start_text)
+    if not separator:
+        return start, start + 1
+    return start, _highlight_timestamp_seconds(end_text)
+
+
+
+def _highlight_timestamp_seconds(value: str) -> float:
+    parts = value.split(":")
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return int(minutes) * 60 + float(seconds)
+    hours, minutes, seconds = parts
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _highlight_intervals_overlap(
+    first_start: float, first_end: float, second_start: float, second_end: float
+) -> bool:
+    return max(first_start, second_start) <= min(first_end, second_end)
+
 def replace_media_highlights(item: MediaItem, value: Any) -> MediaItem:
     """Replace structured highlights after validating their portable JSON form."""
     return _replace_media_highlights(item, _normalized_highlights(value))
@@ -694,11 +749,11 @@ def _parse_catalog_edit_value(field: CatalogField | None, value: str) -> Any:
             raise ValueError("解像度は 1920×1080 の形式で入力してください。")
         return {"width": int(match.group(1)), "height": int(match.group(2))}
     if field.value_type == "time_range":
-        # A highlight is either one position (13:23) or one inclusive range
-        # (13:11-14:25).  Hours are optional so short clips stay compact.
-        timestamp = r"(?:\d+:)?[0-5]\d:[0-5]\d"
+        # A highlight is either one position (13:23.417) or one inclusive
+        # range (13:11.250-14:25.900). Hours remain optional.
+        timestamp = r"(?:\d+:)?[0-5]\d:[0-5]\d(?:\.\d{1,3})?"
         if re.fullmatch(rf"{timestamp}(?:\s*-\s*{timestamp})?", text) is None:
-            raise ValueError("見どころ時間は 13:23、または 13:11-14:25 の形式で入力してください。")
+            raise ValueError("見どころ時間は 13:23.417、または 13:11.250-14:25.900 の形式で入力してください。")
         return re.sub(r"\s*-\s*", "-", text)
     return text
 
@@ -770,18 +825,32 @@ def catalog_record_from_media_item(
     )
 
 
-def display_catalog_attribute(attribute: CatalogAttribute) -> str:
+def _display_highlight_time(value: str) -> str:
+    """Keep list cells compact while JSON preserves millisecond precision."""
+    return re.sub(r"\.\d{1,3}(?=$|-)", "", value)
+
+
+
+def display_catalog_attribute(
+    attribute: CatalogAttribute, *, precise_highlights: bool = False
+) -> str:
     """Render a catalog value for the UI without changing what JSON receives."""
     if attribute.value is None:
         return ""
     if isinstance(attribute.value, list):
         if attribute.value_type == "highlights":
             return " / ".join(
-                f"{value.get('time', '')} {value.get('comment', '')}".strip()
+                (
+                    f"{str(value.get('time', ''))} {value.get('comment', '')}".strip()
+                    if precise_highlights
+                    else f"{_display_highlight_time(str(value.get('time', '')))} {value.get('comment', '')}".strip()
+                )
                 for value in attribute.value
                 if isinstance(value, dict)
             )
         return " / ".join(str(value) for value in attribute.value)
+
+
     if attribute.value_type == "resolution" and isinstance(attribute.value, dict):
         width, height = attribute.value.get("width"), attribute.value.get("height")
         if isinstance(width, int) and isinstance(height, int):
@@ -808,7 +877,7 @@ def _probe_media_attributes(path: Path) -> tuple[MediaAttribute, ...]:
     if ffprobe is None:
         return ()
     try:
-        process = subprocess.run(
+        process = managed_process.run(
             [
                 ffprobe,
                 "-v", "error",
@@ -821,6 +890,7 @@ def _probe_media_attributes(path: Path) -> tuple[MediaAttribute, ...]:
             text=True,
             encoding="utf-8",
             timeout=15,
+            label='メディア属性を確認中',
         )
         if process.returncode != 0:
             return ()

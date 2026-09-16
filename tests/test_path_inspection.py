@@ -46,3 +46,11 @@ def test_path_inspection_keeps_a_symbolic_link_as_its_own_path(tmp_path: Path):
     assert broken_info.path == broken
     assert broken_info.kind == "symlink_broken"
     assert not broken_info.exists
+
+
+def test_normalize_path_keeps_significant_trailing_whitespace(tmp_path: Path):
+    path = tmp_path / "file-with-space "
+    path.write_text("content", encoding="utf-8")
+
+    assert normalize_path(str(path)) == path
+    assert inspect_path(str(path)).kind == "file"

@@ -72,7 +72,7 @@ def test_storage_encryption_settings_reject_partial_presets_and_non_strings(tmp_
             raise AssertionError("malformed settings must not be adopted")
 
 
-def test_storage_encryption_settings_save_keeps_relative_text_but_loads_absolute_paths(tmp_path, monkeypatch):
+def test_storage_encryption_settings_save_canonicalizes_relative_paths(tmp_path, monkeypatch):
     path = tmp_path / "storage_encryption.json"
     monkeypatch.setattr(settings, "SETTINGS_PATH", path)
     raw = json.dumps(
@@ -85,7 +85,10 @@ def test_storage_encryption_settings_save_keeps_relative_text_but_loads_absolute
 
     settings.save_text(raw)
 
-    assert json.loads(path.read_text(encoding="utf-8"))["container_favorites"] == ["../container.img"]
+    from foundation.persistent_settings import config_path_text
+    assert json.loads(path.read_text(encoding="utf-8"))["container_favorites"] == [
+        config_path_text("../container.img", base_directory=tmp_path)
+    ]
     assert settings.load_settings().container_favorites == (str(tmp_path.parent / "container.img"),)
 
 
@@ -113,6 +116,8 @@ def test_storage_encryption_screen_keeps_favorites_in_their_own_inputs(tmp_path,
     monkeypatch.setattr(settings, "SETTINGS_PATH", settings_path)
     screen = StorageEncryptionScreen(lambda: None)
     try:
+        assert screen.container_favorites_combo.itemText(0) == "お気に入りなし"
+        assert screen.mount_favorites_combo.itemText(0) == "お気に入りなし"
         assert screen.container_favorites_combo.itemText(1) == str(container)
         assert screen.mount_favorites_combo.itemText(1) == str(mount_point)
         assert screen.preset_combo.itemText(1) == "日常用"

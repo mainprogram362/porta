@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from gui.process_tracking import track_qprocess
+
 from collections.abc import Callable
 from pathlib import Path
 
@@ -18,16 +20,17 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from foundation.path import absolute_path
-from foundation.runtime_activity import RuntimeActivity, begin_runtime_activity
-from gui import AppHeader, AppPageLayout
+from runtime.runtime_activity import RuntimeActivity, begin_runtime_activity
+from gui import AppHeader, AppPageLayout, JsonFieldSpec, JsonSettingsEditor
+from gui.layout_policy import set_text_rows
 from gui.composites import NoWheelComboBox, PathLineInput
-from gui.persistent_settings import create_app_settings_file, show_settings_location_editor
 
 from . import settings
 from .luks import LuksMountRequest, privileged_mount_command, validate_mount_request
@@ -56,21 +59,27 @@ def _add_favorite_paths_menu(
 class StorageEncryptionScreen(QWidget):
     """Open and mount LUKS data after repeated local and privileged checks."""
 
+    def describe_work_state(self):
+        if self._validated_request is not None or self.check_result.toPlainText() != self._initial_check_text:
+            return {"level": 3, "reason": "入力確認またはマウント操作の結果があります。閉じてもマウント解除は行いません。"}
+        return {"level": 2, "reason": "コンテナ・マウント先・認証入力の設定段階です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
+        self._use_readable_font()
         self._return_to_main = return_to_main
         self._settings = settings.load_settings()
         self._validated_request: LuksMountRequest | None = None
         self._process: QProcess | None = None
         self._activity: RuntimeActivity | None = None
         self._settings_dialog: QDialog | None = None
-        self._settings_editor: QTextEdit | None = None
+        self._settings_editor: JsonSettingsEditor | None = None
         self._settings_status: QLabel | None = None
         self._settings_base: QLabel | None = None
-        self.setMinimumSize(760, 540)
         self._build_ui()
         self._reload_favorites()
         self._invalidate_check("コンテナとマウント先を入力し、「入力を確認」を押してください。")
+        self._initial_check_text = self.check_result.toPlainText()
 
     def _build_ui(self) -> None:
         layout = AppPageLayout(self)
@@ -101,12 +110,14 @@ class StorageEncryptionScreen(QWidget):
         paths_box = QGroupBox("開く対象")
         paths_layout = QFormLayout(paths_box)
         paths_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        paths_layout.setHorizontalSpacing(10)
+        paths_layout.setVerticalSpacing(8)
 
         self.container_input = PathLineInput(drop_as="full_path")
         self.container_input.setPlaceholderText("LUKSコンテナまたは /dev/... の絶対パス")
         self.container_input.setToolTip(
             "通常ファイル型のLUKSコンテナ、または /dev/... のブロックデバイスを指定します。"
-            "相対パスを入力した場合は、このアプリの起動場所を基準に絶対パスへ変換します。"
+            "相対パスを入力した場合は、この設定JSONの場所を基準に絶対パスへ変換します。"
         )
         self.container_input.set_context_menu_augmenter(
             lambda menu: _add_favorite_paths_menu(
@@ -122,19 +133,22 @@ class StorageEncryptionScreen(QWidget):
         )
         container_row = QHBoxLayout()
         container_row.setContentsMargins(0, 0, 0, 0)
-        container_row.addWidget(self.container_input, 1)
+        container_row.addWidget(self.container_input, 3)
         self.container_favorites_combo = NoWheelComboBox()
-        self.container_favorites_combo.setMinimumWidth(190)
+        self.container_favorites_combo.setMinimumWidth(0)
+        self.container_favorites_combo.setMinimumContentsLength(0)
+        self.container_favorites_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.container_favorites_combo.setMaximumWidth(self.fontMetrics().horizontalAdvance("あ") * 18)
         self.container_favorites_combo.setToolTip("選ぶと、コンテナ欄をその値で直ちに上書きします。")
         self.container_favorites_combo.currentIndexChanged.connect(self._apply_container_favorite)
-        container_row.addWidget(self.container_favorites_combo)
+        container_row.addWidget(self.container_favorites_combo, 1)
         paths_layout.addRow("暗号化領域", container_row)
 
         self.mount_point_input = PathLineInput(drop_as="directory")
         self.mount_point_input.setPlaceholderText("空のマウント先フォルダの絶対パス")
         self.mount_point_input.setToolTip(
             "空の既存フォルダだけを指定できます。ファイルをドロップした場合は親フォルダを入力します。"
-            "相対パスを入力した場合は、このアプリの起動場所を基準に絶対パスへ変換します。"
+            "相対パスを入力した場合は、この設定JSONの場所を基準に絶対パスへ変換します。"
         )
         self.mount_point_input.set_context_menu_augmenter(
             lambda menu: _add_favorite_paths_menu(
@@ -150,12 +164,15 @@ class StorageEncryptionScreen(QWidget):
         )
         mount_row = QHBoxLayout()
         mount_row.setContentsMargins(0, 0, 0, 0)
-        mount_row.addWidget(self.mount_point_input, 1)
+        mount_row.addWidget(self.mount_point_input, 3)
         self.mount_favorites_combo = NoWheelComboBox()
-        self.mount_favorites_combo.setMinimumWidth(190)
+        self.mount_favorites_combo.setMinimumWidth(0)
+        self.mount_favorites_combo.setMinimumContentsLength(0)
+        self.mount_favorites_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.mount_favorites_combo.setMaximumWidth(self.fontMetrics().horizontalAdvance("あ") * 18)
         self.mount_favorites_combo.setToolTip("選ぶと、マウント先欄をその値で直ちに上書きします。")
         self.mount_favorites_combo.currentIndexChanged.connect(self._apply_mount_favorite)
-        mount_row.addWidget(self.mount_favorites_combo)
+        mount_row.addWidget(self.mount_favorites_combo, 1)
         paths_layout.addRow("マウント先", mount_row)
 
         self.passphrase_input = QLineEdit()
@@ -169,7 +186,6 @@ class StorageEncryptionScreen(QWidget):
         paths_layout.addRow("LUKSパスフレーズ", self.passphrase_input)
 
         self.preset_combo = NoWheelComboBox()
-        self.preset_combo.setMinimumWidth(240)
         self.preset_combo.setToolTip("選ぶと、コンテナとマウント先の両方を直ちに上書きします。")
         self.preset_combo.currentIndexChanged.connect(self._apply_mount_preset)
         preset_row = QHBoxLayout()
@@ -180,7 +196,7 @@ class StorageEncryptionScreen(QWidget):
 
         self.check_result = QPlainTextEdit()
         self.check_result.setReadOnly(True)
-        self.check_result.setMinimumHeight(118)
+        set_text_rows(self.check_result, minimum=5)
         self.check_result.setPlaceholderText("入力確認の結果と、実行結果をここに表示します。選択してコピーできます。")
         layout.addWidget(self.check_result, 1)
 
@@ -195,18 +211,25 @@ class StorageEncryptionScreen(QWidget):
         footer.addStretch(1)
         layout.addLayout(footer)
 
+    def _use_readable_font(self) -> None:
+        """Keep form labels readable without overriding a larger user font."""
+        font = self.font()
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(max(10.0, font.pointSizeF() + 1.0))
+            self.setFont(font)
+
     def _reload_favorites(self) -> None:
         """Reload only complete settings and rebuild the non-persistent controls."""
         self._settings = settings.load_settings()
         self._fill_path_combo(
             self.container_favorites_combo,
             self._settings.container_favorites,
-            "コンテナのお気に入りなし",
+            "お気に入りなし",
         )
         self._fill_path_combo(
             self.mount_favorites_combo,
             self._settings.mount_point_favorites,
-            "マウント先のお気に入りなし",
+            "お気に入りなし",
         )
         self.preset_combo.clear()
         self.preset_combo.addItem("両方のプリセットを選択", -1)
@@ -315,6 +338,7 @@ class StorageEncryptionScreen(QWidget):
             request, passphrase_byte_count=len(secret)
         )
         process = QProcess(self)
+        track_qprocess(process, '暗号化領域の認証・マウント')
         process.setProgram(program)
         process.setArguments(list(arguments))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -370,7 +394,6 @@ class StorageEncryptionScreen(QWidget):
         if self._settings_dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle("暗号化領域マウントの永続設定")
-            dialog.resize(780, 520)
             layout = QVBoxLayout(dialog)
             status = QLabel()
             status.setWordWrap(True)
@@ -383,22 +406,31 @@ class StorageEncryptionScreen(QWidget):
                 "container_favorites は暗号化コンテナ用、mount_point_favorites はマウント先用です。"
                 "mount_presets は名前・コンテナ・マウント先の3項目を1組として登録します。"
                 "空欄だけの枠は無視されます。"
-                "絶対パス、@HOME、~、またはこの設定JSONの場所を基準にした相対パスを使えます。"
+                "@HOME、@PORTA、@USER、@CONFIG、絶対パス、またはこの設定JSONの場所を基準にした相対パスを使えます。"
                 "画面上へ入力するときは、すべて絶対パスに変換されます。"
             )
             help_text.setWordWrap(True)
             layout.addWidget(help_text)
-            editor = QTextEdit()
+            editor = JsonSettingsEditor(
+                validate=settings.validate_text,
+                path_keys={"container_favorites", "mount_point_favorites", "container_path", "mount_point"},
+                fields={
+                    "container_favorites": JsonFieldSpec("暗号化コンテナのお気に入り", "よく使う暗号化コンテナのパスです。"),
+                    "mount_point_favorites": JsonFieldSpec("マウント先のお気に入り", "よく使う展開先フォルダです。"),
+                    "mount_presets": JsonFieldSpec("マウントの組み合わせ", "名前・コンテナ・マウント先を1組として登録します。"),
+                    "name": JsonFieldSpec("名前"),
+                    "container_path": JsonFieldSpec("暗号化コンテナ"),
+                    "mount_point": JsonFieldSpec("マウント先"),
+                },
+            )
             layout.addWidget(editor, 1)
             buttons = QDialogButtonBox()
             template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
-            location = buttons.addButton("保存先入口", QDialogButtonBox.ButtonRole.ActionRole)
-            create = buttons.addButton("保存先・設定を作成", QDialogButtonBox.ButtonRole.ActionRole)
+            editor.bind_edit_button(template)
             save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+            editor.bind_save_button(save)
             close = buttons.addButton(QDialogButtonBox.StandardButton.Close)
             template.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
-            location.clicked.connect(lambda: show_settings_location_editor(dialog))
-            create.clicked.connect(lambda: self.create_settings_file(dialog))
             save.clicked.connect(self.save_settings)
             close.clicked.connect(dialog.close)
             layout.addWidget(buttons)
@@ -411,21 +443,17 @@ class StorageEncryptionScreen(QWidget):
         assert self._settings_base is not None
         self._settings_editor.setPlainText(settings.editable_text())
         state, detail = settings.settings_status()
+        self._settings_editor.set_source_state(state, detail)
         self._settings_status.setText(f"設定状態: {state} — {detail}")
         base = settings.configuration_base_directory()
         self._settings_base.setText(
             f"相対パスの基準（この設定JSONのフォルダ）: {base}"
             if base is not None
-            else "相対パスの基準: 確認できません。保存先入口を先に確認してください。"
+            else "相対パスの基準: 確認できません。メインメニューの「設定」で保存先を確認してください。"
         )
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
-
-    def create_settings_file(self, parent: QWidget) -> None:
-        create_app_settings_file(parent, settings.create_settings_file)
-        if self._settings_editor is not None:
-            self._settings_editor.setPlainText(settings.editable_text())
 
     def save_settings(self) -> None:
         if self._settings_editor is None:

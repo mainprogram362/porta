@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime.runtime_activity import runtime_activity
+
 from collections.abc import Callable
 
 from PySide6.QtCore import QThread, Signal
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui import AppHeader, AppPageLayout, PathLineInput, UrlListTextEdit
+from gui.layout_policy import set_text_rows
 from media import (
     ShitarabaBatchInspection,
     ShitarabaSaveReport,
@@ -34,6 +37,7 @@ class _InspectionThread(QThread):
         super().__init__(parent)
         self._urls = urls
 
+    @runtime_activity('掲示板レスを確認・保存中')
     def run(self) -> None:
         self.completed.emit(inspect_thread_urls(self._urls))
 
@@ -49,6 +53,7 @@ class _SaveThread(QThread):
         self._threads = threads
         self._directory = directory
 
+    @runtime_activity('掲示板レスを確認・保存中')
     def run(self) -> None:
         try:
             self.completed.emit(save_replies(self._threads, self._directory))
@@ -58,6 +63,11 @@ class _SaveThread(QThread):
 
 class BoardResponseArchiveScreen(QWidget):
     """A non-persistent, explicit response-only thread archive workflow."""
+
+    def describe_work_state(self):
+        if self._inspection is not None or self._previewed or self.replies_editor.toPlainText():
+            return {"level": 3, "reason": "接続確認・レスの取得結果を保持しています。"}
+        return {"level": 2, "reason": "スレッドURL・保存先の入力段階です。"}
 
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
@@ -83,7 +93,7 @@ class BoardResponseArchiveScreen(QWidget):
             "https://jbbs.shitaraba.net/bbs/read.cgi/カテゴリ/掲示板ID/スレッドID/\n"
             "1行につき1スレッド。個別レス番号、l50、範囲指定などの末尾は無視します。"
         )
-        self.url_input.setFixedHeight(220)
+        set_text_rows(self.url_input, minimum=4, maximum=9)
         self.url_input.setToolTip("最大100件です。個別レスURLや末尾 l50・範囲指定のURLも対応します。")
         self.url_input.textChanged.connect(self._clear_inspection)
         self.url_input.dropRejected.connect(self._show_drop_rejection)
@@ -103,7 +113,7 @@ class BoardResponseArchiveScreen(QWidget):
         check_layout = QVBoxLayout(check_box)
         self.check_result = QPlainTextEdit()
         self.check_result.setReadOnly(True)
-        self.check_result.setFixedHeight(112)
+        set_text_rows(self.check_result, minimum=3, maximum=5)
         self.check_result.setPlaceholderText("確認すると、各URLの接続・レス形式・件数をここに表示します。")
         check_layout.addWidget(self.check_result)
         extract_row = QHBoxLayout()

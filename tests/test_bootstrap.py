@@ -66,6 +66,8 @@ def test_build_uses_base_python_instead_of_an_activated_venv(monkeypatch, tmp_pa
         "pip",
         "install",
         "--no-cache-dir",
+        "--constraint",
+        str(root / "requirements-runtime.lock"),
         "-e",
         str(root),
     ]

@@ -2,13 +2,13 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from foundation.shared_launchers import LauncherLocations
 from PySide6.QtWidgets import QApplication, QPushButton, QSizePolicy
 
 from apps.system_tools.external_app_launcher import discovery
 from apps.system_tools.external_app_launcher.discovery import ApplicationLocation
 from apps.system_tools.external_app_launcher.window import ExternalAppLauncherScreen
 from apps.system_tools.external_app_launcher import window as external_window
+from apps.system_tools.external_app_launcher.locations import LauncherLocations
 
 
 def _location(path, number: int = 1) -> ApplicationLocation:  # type: ignore[no-untyped-def]
@@ -40,12 +40,14 @@ def test_external_launch_restores_original_desktop_xdg_configuration(tmp_path, m
 
     def fake_popen(*args, **kwargs):  # type: ignore[no-untyped-def]
         captured["environment"] = kwargs["env"]
-        return object()
+        return type("Process", (), {"pid": 12345})()
 
     monkeypatch.setenv("XDG_CONFIG_HOME", "/home/example/.config")
     monkeypatch.setenv("PORTA_ORIGINAL_XDG_CONFIG_HOME", "/portable/vscode/config")
     monkeypatch.setattr(discovery.shutil, "which", lambda _name: "/bin/bash")
     monkeypatch.setattr(discovery.subprocess, "Popen", fake_popen)
+    ignored = []
+    monkeypatch.setattr(discovery, "get_registry", lambda: type("Registry", (), {"ignore": ignored.append})())
 
     discovery.launch(application)
 
@@ -53,6 +55,7 @@ def test_external_launch_restores_original_desktop_xdg_configuration(tmp_path, m
     assert isinstance(environment, dict)
     assert environment["XDG_CONFIG_HOME"] == "/portable/vscode/config"
     assert "PORTA_ORIGINAL_XDG_CONFIG_HOME" not in environment
+    assert ignored == [12345]
 
 
 def test_external_program_scan_explains_missing_and_unmatched_content(tmp_path):
@@ -77,7 +80,7 @@ def test_external_program_screen_uses_only_explicit_locations(tmp_path, monkeypa
     app.mkdir(parents=True)
     (app / "start.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     monkeypatch.setattr(
-        external_window.shared_launchers,
+        external_window.locations,
         "load_external_locations",
         lambda: LauncherLocations("ready", "外部プログラムの置き場を1件読み込みました。", None, (root,)),
     )
@@ -85,7 +88,8 @@ def test_external_program_screen_uses_only_explicit_locations(tmp_path, monkeypa
     screen = ExternalAppLauncherScreen(lambda: None)
     try:
         button = next(button for button in screen.findChildren(QPushButton) if button.text() == app.name)
-        assert button.minimumHeight() == 28
+        assert button.minimumHeight() == 0
+        assert button.sizeHint().height() >= button.fontMetrics().lineSpacing()
         assert button.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
         assert "起動:" in button.toolTip()
         assert "1件のプログラム" in screen.status.text()
@@ -96,7 +100,7 @@ def test_external_program_screen_uses_only_explicit_locations(tmp_path, monkeypa
 def test_external_program_screen_is_nonfatal_with_no_registered_locations(monkeypatch):
     QApplication.instance() or QApplication([])
     monkeypatch.setattr(
-        external_window.shared_launchers,
+        external_window.locations,
         "load_external_locations",
         lambda: LauncherLocations("ready", "外部プログラムの置き場を0件読み込みました。", None),
     )

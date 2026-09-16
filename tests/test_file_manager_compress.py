@@ -59,6 +59,9 @@ def test_compression_dialog_uses_requested_simple_defaults(tmp_path: Path) -> No
         assert "共通パスワードを入力" in dialog.preview_text.toPlainText()
 
         dialog.password_input.setText("shared-password")
+        assert not dialog.start_button.isEnabled()
+        assert "一致しません" in dialog.preview_text.toPlainText()
+        dialog.password_confirmation_input.setText("shared-password")
 
         assert dialog.start_button.isEnabled()
         assert dialog._plan is not None
@@ -75,6 +78,7 @@ def test_zip_mode_explains_that_names_are_visible(tmp_path: Path) -> None:
     dialog = QuickCompressDialog((source,))
     try:
         dialog.password_input.setText("shared-password")
+        dialog.password_confirmation_input.setText("shared-password")
         dialog.format_combo.setCurrentIndex(1)
 
         assert dialog.format_combo.currentData() == "zip"
@@ -99,6 +103,7 @@ def test_individual_in_place_mode_clears_and_disables_destination(tmp_path: Path
     dialog = QuickCompressDialog((first, second))
     try:
         dialog.password_input.setText("shared-password")
+        dialog.password_confirmation_input.setText("shared-password")
         dialog.advanced_group.setChecked(True)
         dialog.individual_mode.setChecked(True)
         assert dialog.in_place_mode.isEnabled()
@@ -275,6 +280,7 @@ def test_compression_dialog_runs_and_keeps_the_result_visible(tmp_path: Path) ->
     dialog = QuickCompressDialog((source,))
     try:
         dialog.password_input.setText("shared-password")
+        dialog.password_confirmation_input.setText("shared-password")
         dialog.archive_name_input.setText("result")
         dialog.start_compress()
         worker = dialog._worker

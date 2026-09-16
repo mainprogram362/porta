@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from gui.process_tracking import track_qprocess
+
 from collections.abc import Callable
 import os
 from pathlib import Path
 import signal
 import tempfile
+import time
 
 from PySide6.QtCore import QProcess, QTimer
 from PySide6.QtWidgets import (
@@ -30,9 +33,12 @@ from PySide6.QtWidgets import (
 )
 
 from foundation.power_status import PowerStatus, read_power_status
-from foundation.runtime_activity import RuntimeActivity, begin_runtime_activity
-from foundation.transient_paths import take_video_encode_paths
-from gui import AppHeader, AppPageLayout, NoWheelComboBox, PathLineInput, PathListInput
+from foundation.safe_transfer import rename_noreplace
+from runtime.runtime_activity import RuntimeActivity, begin_runtime_activity
+from runtime.transient_paths import take_video_encode_paths
+from gui import AppHeader, AppPageLayout, JsonFieldSpec, JsonSettingsEditor, NoWheelComboBox, PathLineInput, PathListInput
+from gui.flow_layout import FlowLayout
+from gui.layout_policy import set_text_rows
 from media.video_encode import (
     FFmpegTools,
     VideoEncodePlan,
@@ -46,7 +52,6 @@ from media.video_encode import (
 )
 
 from . import settings
-from gui.persistent_settings import create_app_settings_file, show_settings_location_editor
 
 
 _ENCODE_PRESETS = {
@@ -93,6 +98,11 @@ _VIDEO_INPUT_SUFFIXES = frozenset(
 class VideoEncoderScreen(QWidget):
     """Batch encode videos only after tool selection and a complete preview."""
 
+    def describe_work_state(self):
+        if self._plan is not None or self._completed_outputs or self._execution_log or self._queue_paused:
+            return {"level": 3, "reason": f"変換計画・実行経過を保持しています。出力済み{len(self._completed_outputs)}件。"}
+        return {"level": 2, "reason": f"入力動画{len(self.path_input.snapshot())}件と変換設定。計画は未確定です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
@@ -120,10 +130,9 @@ class VideoEncoderScreen(QWidget):
         self._detail_dialog: QDialog | None = None
         self._detail_text: QPlainTextEdit | None = None
         self._settings_dialog: QDialog | None = None
-        self._settings_editor: QTextEdit | None = None
+        self._settings_editor: JsonSettingsEditor | None = None
         # ここは外側をスクロールさせない画面なので、各操作欄が崩れない最小値を
         # 明示する。通常の作業では、必要に応じてウィンドウを広げて使える。
-        self.setMinimumSize(820, 760)
         self._build_ui()
         received = take_video_encode_paths()
         if received:
@@ -165,7 +174,7 @@ class VideoEncoderScreen(QWidget):
         )
         self.path_input.set_context_menu_augmenter(self._add_input_path_context_menu)
         self.path_input.actionPerformed.connect(self._notify)
-        input_actions = QHBoxLayout()
+        input_actions = FlowLayout()
         input_actions.setContentsMargins(0, 0, 0, 0)
         check_selected = QPushButton("選択中をチェック")
         check_selected.setToolTip("青く選択中の行だけを変換対象にします。ほかのチェックは変えません。")
@@ -175,7 +184,6 @@ class VideoEncoderScreen(QWidget):
         uncheck_selected.setToolTip("青く選択中の行だけを変換対象から外します。行自体は残します。")
         uncheck_selected.clicked.connect(lambda: self._set_selected_rows_checked(False))
         input_actions.addWidget(uncheck_selected)
-        input_actions.addStretch(1)
         self.path_undo_button = QPushButton("戻る")
         self.path_undo_button.setToolTip("入力一覧のパスとチェック状態だけを1つ前へ戻します。実ファイルは変更しません。")
         self.path_undo_button.clicked.connect(self.undo_path_change)
@@ -223,7 +231,6 @@ class VideoEncoderScreen(QWidget):
             "出力ファイル名の末尾です。例: _compressed → movie_compressed.mp4。"
             "空欄は従来どおり _encoded を使います。"
         )
-        self.output_suffix_input.setMinimumWidth(82)
         output_options_layout.addWidget(QLabel("末尾"))
         output_options_layout.addWidget(self.output_suffix_input)
         tools_layout.addRow(output_options)
@@ -236,7 +243,7 @@ class VideoEncoderScreen(QWidget):
         self.ffprobe_input.setPlaceholderText("ffprobe のフルパス")
         tools_layout.addRow("ffprobe", self.ffprobe_input)
         tool_buttons = QHBoxLayout()
-        detect_button = QPushButton("標準の場所から探索")
+        detect_button = QPushButton("PORTA内・本体から探索")
         detect_button.clicked.connect(self.detect_tools)
         tool_buttons.addWidget(detect_button)
         test_tools_button = QPushButton("表示中のパスをテスト")
@@ -262,9 +269,9 @@ class VideoEncoderScreen(QWidget):
         self.preset_combo.currentIndexChanged.connect(self._apply_encode_preset)
         edit_layout.addRow("プリセット", self.preset_combo)
         self.encode_backend_combo = NoWheelComboBox()
-        self.encode_backend_combo.addItem("CPU（ソフトウェア・現在利用可能）", "software")
+        self.encode_backend_combo.addItem("CPU（ソフトウェア）", "software")
+        self.encode_backend_combo.addItem("NVIDIA NVENC（確認して使用）", "nvidia_nvenc")
         for label, key in (
-            ("NVIDIA NVENC（未検査）", "nvidia_nvenc"),
             ("Intel Quick Sync（未検査）", "intel_qsv"),
             ("VA-API / Intel・AMD（未検査）", "vaapi"),
         ):
@@ -274,14 +281,14 @@ class VideoEncoderScreen(QWidget):
             )
             if model_item is not None:
                 model_item.setEnabled(False)
-                model_item.setToolTip("GPUとFFmpegの事前テストをまだ実装していないため選択できません。")
+                model_item.setToolTip("このGPU方式はまだ実装していません。")
         self.encode_backend_combo.setToolTip(
-            "GPU方式は候補と利用可否を分離しています。現在は検査を行わず、CPUだけを使用できます。"
+            "NVIDIAを選ぶと、変換内容の確認時にFFmpegの対応と実GPUでの無出力テストを行います。"
         )
         self.encode_backend_combo.currentIndexChanged.connect(self._mark_preview_stale)
         edit_layout.addRow("実行装置", self.encode_backend_combo)
         self.encode_backend_status = QLabel(
-            "GPU事前テスト: 未実装（FFmpeg・GPUを検査していません）"
+            "NVIDIA NVENC: 選択後、「変換内容を確認」でFFmpegとGPUを実機テストします。"
         )
         self.encode_backend_status.setWordWrap(True)
         edit_layout.addRow("装置確認", self.encode_backend_status)
@@ -448,7 +455,7 @@ class VideoEncoderScreen(QWidget):
         self._add_rule_detail_widgets()
         self.rule_list = QPlainTextEdit()
         self.rule_list.setReadOnly(True)
-        self.rule_list.setFixedHeight(58)
+        set_text_rows(self.rule_list, minimum=2, maximum=2)
         self.rule_list.setPlaceholderText("追加した編集ルールをここに表示します。削除は「最後のルールを削除」で末尾から行えます。")
         rules_layout.addWidget(self.rule_list)
         self._edit_rules = []
@@ -458,6 +465,10 @@ class VideoEncoderScreen(QWidget):
         self._refresh_edit_rules_visibility()
         layout.addWidget(self.rules_box)
 
+        self.sample_check = QCheckBox("試し変換（編集後の先頭15秒）")
+        self.sample_check.setToolTip("CPU／GPUを切り替えて同じ条件で実行すると比較できます。別名で出力し、実行詳細に所要時間とサイズを表示します。画質は出力を開いて確認してください。")
+        self.sample_check.toggled.connect(self._mark_preview_stale)
+        layout.addWidget(self.sample_check)
         actions = QHBoxLayout()
         self.preview_button = QPushButton("変換内容を確認")
         self.preview_button.clicked.connect(self.update_preview)
@@ -522,7 +533,7 @@ class VideoEncoderScreen(QWidget):
         preview_layout = QVBoxLayout(preview_box)
         self.preview = QPlainTextEdit()
         self.preview.setReadOnly(True)
-        self.preview.setMinimumHeight(160)
+        set_text_rows(self.preview, minimum=4)
         self.preview.setPlaceholderText("FFmpegの選定と、作成予定のファイル名をここで確認します。")
         preview_layout.addWidget(self.preview, 1)
 
@@ -530,7 +541,7 @@ class VideoEncoderScreen(QWidget):
         notice_layout = QVBoxLayout(notice_box)
         self.notice = QPlainTextEdit()
         self.notice.setReadOnly(True)
-        self.notice.setMinimumHeight(160)
+        set_text_rows(self.notice, minimum=3)
         self.notice.setPlaceholderText("実行結果をここに表示します。選択してコピーできます。")
         notice_layout.addWidget(self.notice, 1)
         bottom_row = QHBoxLayout()
@@ -646,8 +657,8 @@ class VideoEncoderScreen(QWidget):
     def _add_input_path_context_menu(self, menu: QMenu, item) -> None:  # type: ignore[no-untyped-def]
         """Add only non-destructive list operations useful before encoding."""
         clicked_path = (
-            Path(item.text(1).strip())
-            if item is not None and item.text(1).strip()
+            Path(item.text(1))
+            if item is not None and item.text(1)
             else None
         )
         if clicked_path is not None and clicked_path.is_dir() and not clicked_path.is_symlink():
@@ -783,15 +794,19 @@ class VideoEncoderScreen(QWidget):
         except ValueError as exc:
             self.ffmpeg_input.clear()
             self.ffprobe_input.clear()
-            self.tool_status.setText("自動探索: 使えるFFmpeg / ffprobeを確認できませんでした。")
+            self.tool_status.setText(
+                "自動探索: 見つかりません。FFmpeg / ffprobeのパスを手入力してください。"
+            )
             if not initial:
-                self._notify("標準の場所からFFmpegを使えません。", str(exc))
+                self._notify("FFmpegを自動検出できません。", str(exc))
             return
         self.ffmpeg_input.setText(str(tools.ffmpeg))
         self.ffprobe_input.setText(str(tools.ffprobe))
         self.tool_status.setText("FFmpeg / ffprobe: 使用可")
         if not initial:
-            self._notify("ffmpeg と ffprobe を見つけ、実行テストに合格しました。")
+            self._notify(
+                "バックエンド、本体の順に探索し、ffmpeg / ffprobeを確認しました。"
+            )
 
     def test_displayed_tools(self, *, configured: bool = False) -> None:
         try:
@@ -1093,6 +1108,7 @@ class VideoEncoderScreen(QWidget):
                 target_size_mib=target_size,
                 edit_rules=self._effective_edit_rules(),
                 encode_backend=self.encode_backend_combo.currentData(),
+                sample_seconds=15 if self.sample_check.isChecked() else None,
             )
             preview = build_encode_preview(tools, request)
         except ValueError as exc:
@@ -1101,6 +1117,8 @@ class VideoEncoderScreen(QWidget):
         self.preview.setPlainText(preview.text)
         self._plan = preview.plan
         self.execute_button.setEnabled(preview.is_ready)
+        if request.encode_backend == "nvidia_nvenc" and preview.is_ready:
+            self.encode_backend_status.setText("NVIDIA NVENC: 実機テスト合格。今回の計画で使用します。")
 
     def _selected_resolution(self) -> tuple[int, int] | None:
         text = self.resolution_input.text().strip()
@@ -1257,7 +1275,7 @@ class VideoEncoderScreen(QWidget):
         if self._wait_for_charge_before_next_item():
             return
         item = self._plan.items[self._queue_index]
-        if not item.source.is_file() or item.output.exists():
+        if not item.source.is_file() or item.output.exists() or item.temporary_output.exists():
             self._cleanup_temporary_run_directory()
             self._update_execution_buttons()
             self._notify("プレビュー後に対象または出力先が変化したため中止しました。", str(item.source))
@@ -1270,20 +1288,22 @@ class VideoEncoderScreen(QWidget):
             self._notify("実行準備をできません。", str(exc))
             return
         process = QProcess(self)
+        track_qprocess(process, 'FFmpeg動画変換')
         process.setProgram(command[0])
         process.setArguments(list(command[1:]))
-        process.finished.connect(lambda code, _status: self._finish_current_item(item.output, code))
+        process.finished.connect(lambda code, _status: self._finish_current_item(item, code))
         process.errorOccurred.connect(lambda _error: self._report_process_error())
         process.readyReadStandardError.connect(lambda: self._capture_process_error_output(process))
         self._process = process
-        self._current_output = item.output
+        self._current_output = item.temporary_output
         self._append_execution_detail(
             f"開始 {self._queue_index + 1}/{len(self._plan.items)}\n"
-            f"入力: {item.source}\n出力: {item.output}\n"
+            f"入力: {item.source}\n出力予定: {item.output}\n変換中: {item.temporary_output}\n"
             f"コマンド: {' '.join(command)}\n"
         )
         self._update_execution_buttons()
         self._notify(f"変換中: {self._queue_index + 1}/{len(self._plan.items)}", str(item.source))
+        self._item_started = time.monotonic()
         process.start()
 
     def _command_for_item(self, item) -> tuple[str, ...]:  # type: ignore[no-untyped-def]
@@ -1295,33 +1315,55 @@ class VideoEncoderScreen(QWidget):
         manifest.write_text(keyframe_cut_concat_text(item), encoding="utf-8")
         return build_keyframe_cut_command(self._plan.tools, item, manifest)
 
-    def _finish_current_item(self, output: Path, exit_code: int) -> None:
+    def _finish_current_item(self, item, exit_code: int) -> None:  # type: ignore[no-untyped-def]
         process = self._process
         if process is not None:
             self._capture_process_error_output(process)
         self._process = None
         self._current_output = None
         self._paused_process = False
+        output = item.output
+        temporary_output = item.temporary_output
         if self._stop_now_requested:
-            if output.exists():
+            if temporary_output.exists():
                 try:
-                    output.unlink()
+                    temporary_output.unlink()
                 except OSError:
                     pass
             self._cleanup_temporary_run_directory()
             self._update_execution_buttons()
             self._notify("変換をすぐ中止しました。", "現在の未完成出力は削除を試みました。完了済みの動画は残しています。")
             return
-        if exit_code != 0 or not output.is_file():
+        if exit_code != 0 or not temporary_output.is_file():
             detail = bytes(process.readAllStandardError()).decode(errors="replace").strip() if process else ""
             self._append_execution_detail(f"失敗: 終了コード {exit_code}\n{detail}\n")
             self._cleanup_temporary_run_directory()
             self._update_execution_buttons()
-            self._notify("変換に失敗しました。以降は実行しません。", detail[-1500:])
+            self._notify(
+                "変換に失敗しました。以降は実行しません。",
+                f"未確認の出力が残っている場合: {temporary_output}",
+                detail[-1500:],
+            )
+            return
+        if output.exists():
+            self._cleanup_temporary_run_directory()
+            self._update_execution_buttons()
+            self._notify("完成名が変化したため、未確認出力を残して中止しました。", str(temporary_output))
+            return
+        try:
+            rename_noreplace(temporary_output, output)
+        except OSError as exc:
+            self._cleanup_temporary_run_directory()
+            self._update_execution_buttons()
+            self._notify("完成名へ確定できませんでした。未確認出力を残しています。", str(temporary_output), str(exc))
             return
         self._completed_outputs.append(output)
         self._queue_index += 1
         self._append_execution_detail(f"完了: {output}\n")
+        started = getattr(self, "_item_started", None)
+        if started is not None:
+            elapsed = time.monotonic() - started
+            self._append_execution_detail(f"所要時間: {elapsed:.2f} 秒 / 出力サイズ: {output.stat().st_size:,} bytes\n")
         if self._stop_after_current:
             self._cleanup_temporary_run_directory()
             self._update_execution_buttons()
@@ -1368,7 +1410,6 @@ class VideoEncoderScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("動画エンコードの実行詳細（一時表示）")
-        dialog.setMinimumSize(760, 480)
         layout = QVBoxLayout(dialog)
         state, detail = settings.settings_status()
         layout.addWidget(QLabel(f"設定状態: {state} — {detail}"))
@@ -1498,22 +1539,34 @@ class VideoEncoderScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("動画エンコードの永続設定")
-        dialog.setMinimumSize(720, 520)
         layout = QVBoxLayout(dialog)
         explanation = QLabel(settings.help_text())
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
-        editor = QTextEdit(settings.editable_text())
+        editor = JsonSettingsEditor(
+            validate=settings.validate_text,
+            path_keys={"path", "ffmpeg_path", "ffprobe_path"},
+            fields={
+                "path_settings": JsonFieldSpec("登録する場所", "入力元・出力先・右クリック候補として使う場所です。"),
+                "path": JsonFieldSpec("パス", "空欄の項目は使用されません。"),
+                "initial_source": JsonFieldSpec("起動時の入力元", "起動時に変換対象一覧へ入れます。"),
+                "initial_output": JsonFieldSpec("起動時の出力先", "使用できるのは1件だけです。"),
+                "context_menu": JsonFieldSpec("右クリック候補", "入力元と出力先の候補へ表示します。"),
+                "ffmpeg_path": JsonFieldSpec("FFmpegの場所", "空欄ならPORTA内とパソコン本体から自動探索します。"),
+                "ffprobe_path": JsonFieldSpec("FFprobeの場所", "空欄ならPORTA内とパソコン本体から自動探索します。"),
+            },
+        )
+        editor.setPlainText(settings.editable_text())
+        state, detail = settings.settings_status()
+        editor.set_source_state(state, detail)
         layout.addWidget(editor, 1)
         buttons = QDialogButtonBox()
         template = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
-        location = buttons.addButton("保存先入口", QDialogButtonBox.ButtonRole.ActionRole)
-        create = buttons.addButton("保存先・設定を作成", QDialogButtonBox.ButtonRole.ActionRole)
+        editor.bind_edit_button(template)
         save = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+        editor.bind_save_button(save)
         close = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
         template.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
-        location.clicked.connect(lambda: show_settings_location_editor(dialog))
-        create.clicked.connect(lambda: create_app_settings_file(dialog, settings.create_settings_file))
         save.clicked.connect(self.save_settings)
         close.clicked.connect(dialog.reject)
         layout.addWidget(buttons)

@@ -13,6 +13,7 @@ from PySide6.QtCore import QEvent, QTimer, Qt
 
 from apps.media_tools.media_information.window import MediaInformationScreen
 from apps.media_tools.media_information.details_dialog import _selected_table_text
+from apps.media_tools.media_information.workflow import mpv_highlight_time_text
 from media.catalog import CatalogAttribute
 from media.file_attributes import catalog_record_from_media_item
 from media.file_attributes import media_item_token
@@ -37,6 +38,13 @@ def _parts_document(name: str) -> MediaPartsDocument:
                 )
             ),
         )
+    )
+
+
+def test_identical_bracket_times_are_stored_as_one_highlight_point() -> None:
+    assert mpv_highlight_time_text(23 * 60 + 12.345, 23 * 60 + 12.345) == "23:12.345"
+    assert mpv_highlight_time_text(23 * 60 + 12.345, 23 * 60 + 12.678) == (
+        "23:12.345-23:12.678"
     )
 
 
@@ -139,7 +147,6 @@ def test_single_loaded_parts_json_auto_fills_and_enables_only_its_overwrite(
     extra.write_bytes(b"extra")
     screen = MediaInformationScreen(lambda: None)
     try:
-        screen._settings["auto_fill_single_json_path"] = True
         screen.path_input.append_items([str(source), str(extra)])
         screen.confirm_all_paths()
 
@@ -167,7 +174,6 @@ def test_multiple_loaded_json_files_do_not_enable_overwrite_or_auto_fill(tmp_pat
     create_parts(second, _parts_document("second.mp4"))
     screen = MediaInformationScreen(lambda: None)
     try:
-        screen._settings["auto_fill_single_json_path"] = True
         screen.path_input.append_items([str(first), str(second)])
         screen.confirm_all_paths()
 
@@ -178,23 +184,18 @@ def test_multiple_loaded_json_files_do_not_enable_overwrite_or_auto_fill(tmp_pat
         screen.close()
 
 
-def test_single_json_auto_fill_can_be_disabled_without_disabling_manual_overwrite_path(
-    tmp_path: Path,
-):
+def test_single_json_auto_fill_is_unconditional_but_does_not_write_automatically(tmp_path: Path):
     QApplication.instance() or QApplication([])
     source = tmp_path / "parts.json"
     create_parts(source, _parts_document("clip.mp4"))
     screen = MediaInformationScreen(lambda: None)
     try:
-        screen._settings["auto_fill_single_json_path"] = False
         screen.path_input.append_items([str(source)])
         screen.confirm_all_paths()
 
-        assert screen.export_path_input.text() == ""
-        assert not screen.parts_overwrite_button.isEnabled()
-
-        screen.export_path_input.setText(str(source))
+        assert screen.export_path_input.text() == str(source)
         assert screen.parts_overwrite_button.isEnabled()
+        assert len(load_parts(source).parts) == 1
     finally:
         screen.close()
 

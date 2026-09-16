@@ -1,4 +1,4 @@
-"""Compatibility exports for the retired standalone JSON viewer."""
+"""Compatibility exports for the retired JSON viewer."""
 
 from apps.media_tools.media_information.browsing import (
     MAXIMUM_MATCH_CANDIDATES,

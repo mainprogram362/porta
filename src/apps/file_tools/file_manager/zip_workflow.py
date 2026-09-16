@@ -7,8 +7,11 @@ import os
 from pathlib import Path
 import shutil
 import zipfile
+import tempfile
 
 from foundation.path import path_entry_exists
+from foundation.safe_transfer import rename_noreplace
+from runtime.operation_progress import checkpoint, completed
 
 from .copy_workflow import parse_destination_paths, parse_target_paths
 
@@ -92,13 +95,18 @@ def execute_zip_plan(plan: ZipPlan) -> list[Path]:
     created: list[Path] = []
     try:
         for item in plan.archives:
-            _write_zip(item.source, item.output)
-            _verify_zip(item.source, item.output)
+            checkpoint(str(item.source))
+            with tempfile.TemporaryDirectory(prefix=".porta-zip-", dir=item.output.parent) as temporary:
+                staged = Path(temporary) / "archive.zip"
+                _write_zip(item.source, staged)
+                _verify_zip(item.source, staged)
+                checkpoint()
+                rename_noreplace(staged, item.output)
             created.append(item.output)
-    except Exception:
-        for output in reversed(created):
-            output.unlink(missing_ok=True)
-        raise
+            completed(item.source, item.output, "ZIP作成完了")
+    except Exception as exc:
+        raise OSError("ZIP作成が停止しました。完成した出力は保持しています。\n"
+                      + "\n".join(map(str, created)) + f"\n{exc}") from exc
     return created
 
 
@@ -125,6 +133,7 @@ def _write_zip(source: Path, output: Path) -> None:
             archive.write(source, source.name)
         else:
             for path in source.rglob("*"):
+                checkpoint()
                 if path.is_file():
                     archive.write(path, path.relative_to(source.parent))
 

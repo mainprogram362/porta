@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import shlex
 
 
 _REPLY_HEADER = re.compile(r"^\[(?P<number>\d+)\] (?P<metadata>[^\n]*)\n", re.MULTILINE)
@@ -51,6 +52,18 @@ class TextSearchHit:
 
     document_index: int
     reply_number: int
+
+
+@dataclass(frozen=True)
+class TextSearchQuery:
+    """Parsed lightweight query: OR groups of AND terms plus global exclusions."""
+
+    groups: tuple[tuple[str, ...], ...]
+    excluded: tuple[str, ...]
+
+    @property
+    def active(self) -> bool:
+        return bool(self.groups or self.excluded)
 
 
 @dataclass(frozen=True)
@@ -166,10 +179,47 @@ def reply_descendant_tree(
     return build(target_number, 1, frozenset({target_number}))
 
 
+def parse_text_search_query(query: str) -> TextSearchQuery:
+    """Parse a forgiving human query without executing regular expressions.
+
+    Whitespace and ``AND`` join required terms, ``OR``/``|`` split alternative
+    groups, and a leading ``-`` excludes a term from every group. Quoted text
+    is treated as one term. An unmatched quote falls back to literal words so
+    typing an incomplete query never interrupts the viewer.
+    """
+    source = query.strip()
+    if not source:
+        return TextSearchQuery((), ())
+    try:
+        tokens = shlex.split(source)
+    except ValueError:
+        tokens = source.split()
+
+    groups: list[list[str]] = [[]]
+    excluded: list[str] = []
+    for token in tokens:
+        if token in {"OR", "|", "｜"}:
+            if groups[-1]:
+                groups.append([])
+            continue
+        if token == "AND":
+            continue
+        if token.startswith(("-", "−")) and len(token) > 1:
+            term = token[1:].casefold()
+            if term and term not in excluded:
+                excluded.append(term)
+            continue
+        term = token.casefold()
+        if term and term not in groups[-1]:
+            groups[-1].append(term)
+    positive_groups = tuple(tuple(group) for group in groups if group)
+    return TextSearchQuery(positive_groups, tuple(excluded))
+
+
 def find_text_hits(documents: tuple[TextThreadDocument, ...], query: str) -> tuple[TextSearchHit, ...]:
-    """Find response matches in document order for seamless next/previous navigation."""
-    needle = query.strip().casefold()
-    if not needle:
+    """Find AND/OR/exclusion matches in document order for seamless navigation."""
+    parsed = parse_text_search_query(query)
+    if not parsed.active:
         return ()
     hits: list[TextSearchHit] = []
     for document_index, document in enumerate(documents):
@@ -177,6 +227,10 @@ def find_text_hits(documents: tuple[TextThreadDocument, ...], query: str) -> tup
             searchable = "\n".join(
                 (str(reply.number), reply.name, reply.posted_at, reply.poster_id, reply.body)
             ).casefold()
-            if needle in searchable:
+            positive = not parsed.groups or any(
+                all(term in searchable for term in group) for group in parsed.groups
+            )
+            negative = any(term in searchable for term in parsed.excluded)
+            if positive and not negative:
                 hits.append(TextSearchHit(document_index, reply.number))
     return tuple(hits)

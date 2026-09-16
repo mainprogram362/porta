@@ -6,17 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foundation.json_settings import (
-    atomic_write_json,
-    create_app_settings_file,
-    editable_settings_text,
-    settings_destination,
-    validated_settings_status,
-)
-from foundation.path_tokens import expand_setting_path
+from settings.json_settings import atomic_write_json, create_app_settings_file, editable_settings_text, settings_destination, validated_settings_status
+from settings.persistent_settings import config_path_text, resolve_config_path
 from media.mpv_player import (
     default_shortcut_settings,
-    shortcut_help,
     upgrade_shortcut_settings,
     validate_shortcut_settings,
 )
@@ -43,11 +36,8 @@ DISPLAYABLE_PATH_COLUMNS = (
 def default_settings() -> dict[str, Any]:
     """Return explicit defaults without paths, history, or hidden state."""
     return {
-        "auto_fill_single_json_path": True,
         "registered_paths": [],
         "mpv_path": "/usr/bin/mpv",
-        "mpv_shortcuts": default_shortcut_settings(),
-        "_mpv_shortcuts_help": shortcut_help(),
         "mpv_tag_choices": [],
         "_mpv_tag_choices_help": (
             "mpv再生中に t を押すと、ここに登録したタグを選べます。"
@@ -57,6 +47,9 @@ def default_settings() -> dict[str, Any]:
         # The path and state icon stay structural. This list controls only
         # optional fact columns.
         "default_visible_columns": ["サイズ", "評価", "見どころ"],
+        # Core keys are stable and custom mpv keys are advanced, so keep this
+        # compact section at the end of the user-facing template.
+        "mpv_shortcuts": default_shortcut_settings(),
     }
 
 
@@ -82,11 +75,13 @@ def _merged_editable_text(text: str) -> str:
         return text
     if not isinstance(raw, dict):
         return text
-    # ``catalog_json_path`` was an older saved destination.  Destinations are
-    # now session-only, so omit it when presenting an existing settings file
-    # instead of making the whole file invalid.
+    # These were older saved destination/behavior values.  Destinations are
+    # now session-only and single-JSON autofill is unconditional, so omit both
+    # instead of making an otherwise usable existing file invalid.
     raw = dict(raw)
     raw.pop("catalog_json_path", None)
+    raw.pop("auto_fill_single_json_path", None)
+    raw.pop("_mpv_shortcuts_help", None)
     defaults = default_settings()
     if not set(raw).issubset(defaults):
         return text
@@ -109,11 +104,6 @@ def validate_text(text: str) -> dict[str, Any]:
     unknown = set(raw) - set(defaults)
     if unknown:
         raise ValueError("未対応の設定項目があります: " + ", ".join(sorted(unknown)))
-    auto_fill_single_json_path = raw.get(
-        "auto_fill_single_json_path", defaults["auto_fill_single_json_path"]
-    )
-    if not isinstance(auto_fill_single_json_path, bool):
-        raise ValueError("auto_fill_single_json_path は true または false にしてください。")
     registered_raw = raw.get("registered_paths", defaults["registered_paths"])
     if not isinstance(registered_raw, list) or not all(isinstance(value, str) for value in registered_raw):
         raise ValueError("registered_paths はパス文字列の配列にしてください。")
@@ -122,16 +112,20 @@ def validate_text(text: str) -> dict[str, Any]:
         text_value = path_text.strip()
         if not text_value:
             continue
-        expanded = expand_setting_path(text_value)
+        expanded = resolve_config_path(text_value)
         if "\x00" in expanded or not Path(expanded).is_absolute():
             raise ValueError(
-                f"registered_paths の {index} 件目は @HOME、~、または / から始まるパスにしてください。"
+                f"registered_paths の {index} 件目は共通パス記法または絶対パスにしてください。"
             )
         registered_paths.append(expanded)
     mpv_path = raw.get("mpv_path", defaults["mpv_path"])
     if not isinstance(mpv_path, str) or not mpv_path.strip():
         raise ValueError("mpv_path は実行ファイルの絶対パスにしてください。")
-    if not Path(mpv_path).expanduser().is_absolute():
+    try:
+        resolved_mpv_path = resolve_config_path(mpv_path)
+    except ValueError as exc:
+        raise ValueError("mpv_path は共通パス記法または絶対パスにしてください。") from exc
+    if not Path(resolved_mpv_path).is_absolute():
         raise ValueError("mpv_path は実行ファイルの絶対パスにしてください。")
     visible = raw.get("default_visible_columns", defaults["default_visible_columns"])
     if not isinstance(visible, list) or not all(isinstance(label, str) for label in visible):
@@ -141,21 +135,14 @@ def validate_text(text: str) -> dict[str, Any]:
         raise ValueError("表示できない項目があります: " + ", ".join(sorted(unknown_columns)))
     normalized_columns = [label for label in DISPLAYABLE_PATH_COLUMNS if label in visible]
     shortcuts = validate_shortcut_settings(raw.get("mpv_shortcuts", defaults["mpv_shortcuts"]))
-    help_text = raw.get("_mpv_shortcuts_help", defaults["_mpv_shortcuts_help"])
-    if not isinstance(help_text, dict) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in help_text.items()
-    ):
-        raise ValueError("_mpv_shortcuts_help は説明用の文字列一覧にしてください。")
     tag_choices = _validate_mpv_tag_choices(raw.get("mpv_tag_choices", defaults["mpv_tag_choices"]))
     tag_choices_help = raw.get("_mpv_tag_choices_help", defaults["_mpv_tag_choices_help"])
     if not isinstance(tag_choices_help, str):
         raise ValueError("_mpv_tag_choices_help は説明用の文字列にしてください。")
     return {
-        "auto_fill_single_json_path": auto_fill_single_json_path,
         "registered_paths": registered_paths,
-        "mpv_path": str(Path(mpv_path).expanduser()),
+        "mpv_path": resolved_mpv_path,
         "mpv_shortcuts": shortcuts,
-        "_mpv_shortcuts_help": dict(help_text),
         "mpv_tag_choices": tag_choices,
         "_mpv_tag_choices_help": tag_choices_help,
         "default_visible_columns": normalized_columns,
@@ -200,6 +187,8 @@ def save_text(text: str) -> dict[str, Any]:
     raw: Any = json.loads(text)
     defaults = default_settings()
     saved = {key: raw.get(key, defaults[key]) for key in defaults}
+    saved["registered_paths"] = [config_path_text(path) for path in settings["registered_paths"]]
+    saved["mpv_path"] = config_path_text(settings["mpv_path"])
     saved["mpv_shortcuts"] = settings["mpv_shortcuts"]
     saved["mpv_tag_choices"] = settings["mpv_tag_choices"]
     path = settings_destination(SETTINGS_FILE_NAME, SETTINGS_PATH)

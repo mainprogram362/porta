@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime.runtime_activity import runtime_activity
+
 import os
 from pathlib import Path
 import shutil
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from foundation.path import path_entry_exists
 from gui import NoWheelComboBox, PathLineInput
+from gui.layout_policy import set_text_rows
 
 from .archive_backends import ArchiveCommandCancelled, select_archive_backend
 from .compress_workflow import (
@@ -81,6 +84,7 @@ class CooperativeCompressThread(QThread):
             self._condition.notify_all()
         self._set_process_paused(False)
 
+    @runtime_activity('ファイル圧縮中')
     def run(self) -> None:
         try:
             revalidate_compression_plan(self._plan)
@@ -221,7 +225,6 @@ class QuickCompressDialog(QDialog):
     def __init__(self, sources: tuple[Path, ...]) -> None:
         super().__init__(None)
         self.setWindowTitle(f"圧縮ファイルを作成（{len(sources)}件）")
-        self.setMinimumSize(760, 760)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._sources = sources
         self._plan: CompressionPlan | None = None
@@ -242,7 +245,7 @@ class QuickCompressDialog(QDialog):
         layout.addWidget(QLabel(f"圧縮対象（{len(sources)}件）"))
         self.sources_text = QTextEdit()
         self.sources_text.setReadOnly(True)
-        self.sources_text.setMaximumHeight(110)
+        set_text_rows(self.sources_text, minimum=2, maximum=5)
         self.sources_text.setPlainText("\n".join(str(path) for path in sources))
         layout.addWidget(self.sources_text)
 
@@ -272,9 +275,20 @@ class QuickCompressDialog(QDialog):
         self.hide_names.setChecked(True)
         self.hide_names.toggled.connect(self._hide_names_changed)
         password_row.addWidget(self.hide_names)
+        confirmation_row = QHBoxLayout()
+        confirmation_row.addWidget(QLabel("パスワード確認"))
+        self.password_confirmation_input = QLineEdit()
+        self.password_confirmation_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_confirmation_input.setPlaceholderText(
+            "確認のため、同じパスワードをもう一度入力"
+        )
+        self.password_confirmation_input.textChanged.connect(self.refresh_preview)
+        confirmation_row.addWidget(self.password_confirmation_input, 1)
         layout.addLayout(password_row)
+        layout.addLayout(confirmation_row)
         self.encryption_notice = QLabel(
             "7zのヘッダー暗号化を使用し、内容だけでなくファイル名とフォルダ構成も隠します。"
+            "パスワード付き圧縮では、確認欄にも同じパスワードを入力してください。"
         )
         self.encryption_notice.setWordWrap(True)
         layout.addWidget(self.encryption_notice)
@@ -376,6 +390,19 @@ class QuickCompressDialog(QDialog):
     def refresh_preview(self) -> None:
         if self._running:
             return
+        password_enabled = self.password_enabled.isChecked()
+        if (
+            password_enabled
+            and self.password_input.text() != self.password_confirmation_input.text()
+        ):
+            self._plan = None
+            self.preview_text.setPlainText(
+                f"操作: 圧縮\\n対象: {len(self._sources)}件\\n\\n実行できません。\\n"
+                "パスワードと確認入力が一致しません。"
+            )
+            self.start_button.setEnabled(False)
+            self.stage_label.setText("パスワードの確認入力を一致させてください")
+            return
         individual = self.advanced_group.isChecked() and self.individual_mode.isChecked()
         in_place = individual and self.in_place_mode.isChecked()
         preview = build_compression_preview(
@@ -384,7 +411,7 @@ class QuickCompressDialog(QDialog):
             archive_format=str(self.format_combo.currentData()),
             archive_name=self.archive_name_input.text(),
             compression_level=int(self.level_combo.currentData()),
-            password_enabled=self.password_enabled.isChecked(),
+            password_enabled=password_enabled,
             password=self.password_input.text(),
             hide_names=self.hide_names.isChecked(),
             individual=individual,
@@ -413,11 +440,13 @@ class QuickCompressDialog(QDialog):
             )
             self.encryption_notice.setText(
                 "7zのヘッダー暗号化を使用し、内容だけでなくファイル名とフォルダ構成も隠します。"
+                "パスワード付き圧縮では、確認欄にも同じパスワードを入力してください。"
             )
         self.refresh_preview()
 
     def _password_mode_changed(self, enabled: bool) -> None:
         self.password_input.setEnabled(enabled)
+        self.password_confirmation_input.setEnabled(enabled)
         self.show_password.setEnabled(enabled)
         if not enabled:
             if self.hide_names.isChecked():
@@ -449,7 +478,7 @@ class QuickCompressDialog(QDialog):
 
     def _in_place_mode_changed(self, enabled: bool) -> None:
         if enabled:
-            current = self.destination_input.text().strip()
+            current = self.destination_input.text()
             if current:
                 self._saved_destination = current
             self.destination_input.blockSignals(True)
@@ -462,7 +491,7 @@ class QuickCompressDialog(QDialog):
             )
         else:
             self.destination_input.setEnabled(True)
-            if not self.destination_input.text().strip():
+            if not self.destination_input.text():
                 self.destination_input.setText(self._saved_destination)
             self.destination_notice.setText(
                 "画面を開いた時点で、最初の圧縮対象があるフォルダを設定しています。"
@@ -470,8 +499,8 @@ class QuickCompressDialog(QDialog):
         self.refresh_preview()
 
     def _destination_changed(self, value: str) -> None:
-        if self.destination_input.isEnabled() and value.strip():
-            self._saved_destination = value.strip()
+        if self.destination_input.isEnabled() and value:
+            self._saved_destination = value
         self.refresh_preview()
 
     def start_compress(self) -> None:
@@ -556,6 +585,7 @@ class QuickCompressDialog(QDialog):
         archive_format = str(self.format_combo.currentData())
         individual = self.advanced_group.isChecked() and self.individual_mode.isChecked()
         self.password_input.setEnabled(password_enabled)
+        self.password_confirmation_input.setEnabled(password_enabled)
         self.show_password.setEnabled(password_enabled)
         self.hide_names.setEnabled(password_enabled and archive_format == "7z")
         self.archive_name_input.setEnabled(not individual)
@@ -568,6 +598,7 @@ class QuickCompressDialog(QDialog):
             self.level_combo,
             self.password_enabled,
             self.password_input,
+            self.password_confirmation_input,
             self.show_password,
             self.hide_names,
             self.archive_name_input,
@@ -586,6 +617,7 @@ class QuickCompressDialog(QDialog):
     def _toggle_password_visibility(self, visible: bool) -> None:
         mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
         self.password_input.setEchoMode(mode)
+        self.password_confirmation_input.setEchoMode(mode)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self._running and self._worker is not None:

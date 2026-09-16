@@ -1,0 +1,11 @@
+{
+  "manifest_version": 2,
+  "name": "PORTA Browser Bridge",
+  "version": "0.1.0",
+  "description": "選んだ既存タブをPORTAのカートリッジから操作します。",
+  "browser_specific_settings": {"gecko": {"id": "porta-browser@porta.local", "strict_min_version": "128.0"}},
+  "permissions": ["tabs", "nativeMessaging", "storage"],
+  "optional_permissions": ["http://*/*", "https://*/*"],
+  "background": {"scripts": ["background.js"], "persistent": true},
+  "browser_action": {"default_title": "PORTAに接続", "default_popup": "popup.html"}
+}

@@ -6,14 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, TypedDict
 
-from foundation.json_settings import (
-    atomic_write_json,
-    create_app_settings_file,
-    editable_settings_text,
-    settings_destination,
-    validated_settings_status,
-)
-from foundation.path_tokens import expand_setting_path, home_tokenized
+from settings.json_settings import atomic_write_json, create_app_settings_file, editable_settings_text, settings_destination, validated_settings_status
+from settings.persistent_settings import config_path_text, resolve_config_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -88,8 +82,9 @@ def help_text() -> str:
         '{"path": "@HOME/Videos/encoded", "initial_output": true, "context_menu": true}\n'
         "\n"
         "同じ path に複数属性を書けます。属性を省略した場合は false です。\n"
-        "path が空欄の行は無視します。@HOME は現在の利用者のホームフォルダです。\n"
-        "変換条件・履歴・実行結果は保存しません。FFmpegのパスが空なら起動時に自動探索します。"
+        "path が空欄の行は無視します。@HOME、@PORTA、@USER、@CONFIG と相対パスも使えます。\n"
+        "変換条件・履歴・実行結果は保存しません。FFmpegのパスが空なら、"
+        "PORTA内バックエンド、パソコン本体の順に自動探索し、見つからなければ空欄になります。"
     )
 
 
@@ -101,7 +96,7 @@ def _validated_tool_path(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key, "")
     if not isinstance(value, str):
         raise ValueError(f"{key} は文字列にしてください。")
-    return expand_setting_path(value) if value.strip() else ""
+    return resolve_config_path(value) if value.strip() else ""
 
 
 def _validate_path_settings(value: Any) -> list[EncoderPathSetting]:
@@ -125,10 +120,10 @@ def _validate_path_settings(value: Any) -> list[EncoderPathSetting]:
         path_text = raw_path.strip()
         if not path_text:
             continue
-        expanded = expand_setting_path(path_text)
+        expanded = resolve_config_path(path_text)
         if "\x00" in expanded or not Path(expanded).is_absolute():
             raise ValueError(
-                f"path_settings の {index} 件目は @HOME、~、または / から始まるパスにしてください。"
+                f"path_settings の {index} 件目は共通パス記法または絶対パスにしてください。"
             )
         if expanded in seen:
             raise ValueError(f"path_settings に同じパスが重複しています: {expanded}")
@@ -267,9 +262,9 @@ def _saved_path_entries(text: str, settings_value: EncoderSettings) -> list[dict
             )
             saved.append(blank)
             continue
-        expanded = expand_setting_path(path_text)
+        expanded = resolve_config_path(path_text)
         entry = normalized_by_path[expanded]
-        output: dict[str, Any] = {"path": home_tokenized(expanded)}
+        output: dict[str, Any] = {"path": config_path_text(expanded)}
         output.update({attribute: True for attribute in _PATH_ATTRIBUTES if entry[attribute]})
         saved.append(output)
     return saved
@@ -279,8 +274,8 @@ def save_text(text: str) -> EncoderSettings:
     settings_value = validate_text(text)
     saved = {
         "path_settings": _saved_path_entries(text, settings_value),
-        "ffmpeg_path": home_tokenized(settings_value["ffmpeg_path"]),
-        "ffprobe_path": home_tokenized(settings_value["ffprobe_path"]),
+        "ffmpeg_path": config_path_text(settings_value["ffmpeg_path"]) if settings_value["ffmpeg_path"] else "",
+        "ffprobe_path": config_path_text(settings_value["ffprobe_path"]) if settings_value["ffprobe_path"] else "",
     }
     path = settings_destination(SETTINGS_FILE_NAME, SETTINGS_PATH)
     atomic_write_json(path, saved)

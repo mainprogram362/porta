@@ -18,12 +18,12 @@ from apps.media_tools.board_response_archive import create_screen as create_boar
 from apps.media_tools.text_thread_viewer import create_screen as create_text_thread_viewer_screen
 from apps.media_tools.youtube_downloader import create_screen as create_youtube_downloader_screen
 from apps.media_tools.video_encoder import create_screen as create_video_encoder_screen
-from apps.system_tools.system_remote import create_screen as create_system_remote_screen
-from apps.system_tools.configuration import create_screen as create_configuration_screen
+from apps.text_tools.text_workbench import create_screen as create_text_workbench_screen
+from apps.porta_control import create_screen as create_control_screen
 from apps.system_tools.external_app_launcher import create_screen as create_external_app_launcher_screen
 from apps.system_tools.storage_encryption import create_screen as create_storage_encryption_screen
-from apps.system_tools.local_ai import LocalAiChatScreen, create_screen as create_local_ai_settings_screen
-from apps.system_tools.standalone_apps import create_screen as create_standalone_apps_screen
+from apps.system_tools.local_ai import create_workspace as create_local_ai_screen
+from apps.automation_tools.browser import create_screen as create_browser_screen
 
 
 @dataclass(frozen=True)
@@ -65,56 +65,35 @@ CATEGORIES: tuple[AppCategory, ...] = (
     AppCategory(
         "non_python_programs",
         "それ以外のプログラム",
-        "単体で起動できる独立ツールと、明示登録した外部プログラム",
+        "明示登録した外部プログラムを起動します。",
     ),
     AppCategory("automation_tools", "自動操作", "ブラウザとデスクトップ操作"),
-    AppCategory("system_operations", "システム操作", "Linuxの状態確認と、明示した電源・セッション操作"),
     AppCategory("local_ai", "ローカルAI", "今回だけの会話と、全アプリ共通のAIファイル設定"),
-    AppCategory("settings", "設定", "保存先と、明示的に保存する既定設定を確認・編集"),
 )
 
 APPS: tuple[AppDefinition, ...] = (
+    AppDefinition("browser_automation", "automation_tools", "自動操作",
+                  "接続済みFirefoxのウィンドウとタブを選び、明示した手順を実行します。", create_browser_screen),
     AppDefinition(
         "storage_encryption",
         "storage_encryption",
-        "暗号化領域を開く・マウント",
-        "LUKSコンテナまたはLUKSデバイスを、確認してから開き、空のフォルダへマウントします。",
+        "暗号化・保護",
+        "LUKS、VeraCrypt、7z、ZIP、RAR解凍を方式ごとに確認して扱います。",
         create_storage_encryption_screen,
     ),
     AppDefinition(
-        "configuration",
-        "settings",
-        "設定",
+        "porta_control",
+        "porta_control",
+        "PORTA管理",
         "設定保存先の確認、入口編集、退避付きのCONFIG初期化を行います。",
-        create_configuration_screen,
+        create_control_screen,
     ),
     AppDefinition(
-        "local_ai_settings",
         "local_ai",
-        "ローカルAI設定",
+        "local_ai",
+        "ローカルAI",
         "全アプリ共通で使う llama-server とGGUFモデルの場所を設定します。",
-        create_local_ai_settings_screen,
-    ),
-    AppDefinition(
-        "local_ai_chat",
-        "local_ai",
-        "ローカルAI チャット",
-        "AIを必要な間だけ読み込み、会話履歴を保存せずに使います。",
-        LocalAiChatScreen,
-    ),
-    AppDefinition(
-        "system_remote",
-        "system_operations",
-        "システム操作リモコン",
-        "Linuxの標準的な電源・セッション操作と、PORTA Coreへの入口です。",
-        create_system_remote_screen,
-    ),
-    AppDefinition(
-        "standalone_apps",
-        "non_python_programs",
-        "独立ツール",
-        "PORTAから切り離して単体起動できる低依存ツールを、設定位置から読み込みます。",
-        create_standalone_apps_screen,
+        create_local_ai_screen,
     ),
     AppDefinition(
         "external_app_launcher",
@@ -130,6 +109,13 @@ APPS: tuple[AppDefinition, ...] = (
         "対象パスをまとめて安全にコピーします。",
         create_file_manager_screen,
         show_on_main_menu=True,
+    ),
+    AppDefinition(
+        "text_workbench",
+        "text_tools",
+        "テキスト加工ワークベンチ",
+        "HTMLや文章から必要な部分を抽出し、カット・絞り込み・置換・整形を重ねます。",
+        create_text_workbench_screen,
     ),
     AppDefinition(
         "youtube_downloader",
@@ -184,6 +170,12 @@ def apps_for_category(category_key: str) -> tuple[AppDefinition, ...]:
     return tuple(app for app in APPS if app.category_key == category_key)
 
 
+def sole_app_for_category(category_key: str) -> AppDefinition | None:
+    """Return the direct destination when a category currently has one app."""
+    apps = apps_for_category(category_key)
+    return apps[0] if len(apps) == 1 else None
+
+
 def main_menu_apps() -> tuple[AppDefinition, ...]:
     """Return completed apps intentionally placed on the first menu."""
     return tuple(app for app in APPS if app.show_on_main_menu)
@@ -191,4 +183,11 @@ def main_menu_apps() -> tuple[AppDefinition, ...]:
 
 def app_for_key(key: str) -> AppDefinition | None:
     """Return one registered application for direct one-shot handoff routing."""
+    key = {
+        'configuration': 'porta_control',
+        'environment_check': 'porta_control',
+        'browser_cartridge_editor': 'browser_automation',
+        'local_ai_settings': 'local_ai',
+        'local_ai_chat': 'local_ai',
+    }.get(key, key)
     return next((app for app in APPS if app.key == key), None)

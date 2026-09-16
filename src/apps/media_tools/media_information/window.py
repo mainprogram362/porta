@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from gui.process_tracking import track_qprocess
+
 from collections.abc import Callable, Iterable
 import json
 from pathlib import Path
@@ -12,6 +14,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QDoubleValidator,
     QKeySequence,
+    QKeyEvent,
     QRegularExpressionValidator,
     QShortcut,
 )
@@ -25,7 +28,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -45,6 +47,8 @@ from PySide6.QtWidgets import (
 from gui import (
     AppHeader,
     AppPageLayout,
+    JsonFieldSpec,
+    JsonSettingsEditor,
     NoWheelComboBox,
     PathLineInput,
     PathListInput,
@@ -55,14 +59,14 @@ from gui import (
 )
 from foundation.path import normalize_path
 from foundation.product import PRODUCT_NAME
-from foundation.transient_paths import take_media_paths
+from runtime.transient_paths import take_media_paths
 from media.file_attributes import (
     STANDARD_CATALOG_FIELDS,
     COLLECTION_STATUS_PRESETS,
     FREQUENT_CATALOG_FIELD_KEYS,
     MediaItem,
     apply_catalog_field_operation,
-    append_media_highlight,
+    append_mpv_highlight_replacing_overlaps,
     catalog_field_for_key,
     catalog_attributes_from_media_item,
     catalog_record_from_media_item,
@@ -78,8 +82,12 @@ from media.catalog import unique_json_path
 from media.mpv_player import (
     MpvEvent,
     IsolatedMpvSession,
+    begin_mpv_replacement,
+    copy_porta_settings_to_normal_mpv,
     create_isolated_mpv_session,
     effective_shortcut_bindings,
+    install_normal_mpv_replace_handler,
+    release_owned_mpv,
 )
 from media.review_patch import (
     MediaReviewPatch,
@@ -118,7 +126,6 @@ from . import settings
 from .details_dialog import show_detached_item_details
 from .path_actions import direct_children_for_selected_folders
 from .text_workspace_adapter import text_workspace_rows
-from gui.persistent_settings import create_app_settings_file, show_settings_location_editor
 from apps.file_tools.file_manager import FileManagerScreen
 from .browsing import (
     MAXIMUM_MATCH_CANDIDATES,
@@ -139,6 +146,7 @@ from .workflow import (
     candidate_source_detail as _candidate_source_detail,
     catalog_value as _catalog_value,
     mpv_time_text as _mpv_time_text,
+    mpv_highlight_time_text as _mpv_highlight_time_text,
     operation_description as _operation_description,
     operation_label as _operation_label,
     overwrite_safety_report,
@@ -179,6 +187,12 @@ def _json_signature(value: object) -> str:
 class MediaInformationScreen(QWidget):
     """Browse or stage JSON edits without ever modifying the media files."""
 
+    def describe_work_state(self):
+        if (self._paths_locked or self._items or self._source_items or self._undo_history
+                or self._review_patch is not None or self._parts_output_text or self._review_patch_output_text):
+            return {"level": 3, "reason": f"対象{len(self._items)}件・確定モード・編集結果を保持しています。"}
+        return {"level": 2, "reason": "対象パス・出力先・作業モードの設定段階です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
@@ -201,27 +215,31 @@ class MediaInformationScreen(QWidget):
         self._single_field_merge_items_snapshot: tuple[MediaItem, ...] | None = None
         self._applied_operation_summaries: list[str] = []
         self._applied_operations: list[_AppliedOperation] = []
+        self._operation_kind_field_key: str | None = None
         self._undo_history: list[_UndoState] = []
         self._settings = settings.load_settings()
         self._work_mode = "catalog"
         self._parts_output_text = ""
         self._review_patch_output_text = ""
         self._settings_dialog: QDialog | None = None
-        self._settings_editor: QTextEdit | None = None
+        self._settings_editor: JsonSettingsEditor | None = None
         self._mpv_sessions: dict[QProcess, IsolatedMpvSession] = {}
+        self._mpv_owner_pids: dict[QProcess, int] = {}
         self._mpv_pending_ranges: dict[tuple[str, str], float] = {}
         self._mpv_linked_paths: dict[str, Path] = {}
         self._individual_row: QTreeWidgetItem | None = None
         # This intentionally has no parent.  A parented dialog would also
         # bring the entire workbench forward over mpv on many compositors.
-        self._mpv_comment_dialog: QInputDialog | None = None
+        self._mpv_comment_dialog: QDialog | None = None
         self._mpv_tag_dialog: QDialog | None = None
+        self._mpv_tag_choices: QComboBox | None = None
+        self._mpv_tag_accept: Callable[[], None] | None = None
+        self._mpv_tag_session: IsolatedMpvSession | None = None
         self._mpv_event_timer = QTimer(self)
         self._mpv_event_timer.setInterval(120)
         self._mpv_event_timer.timeout.connect(self._read_mpv_events)
         # This is a workbench, not a form: keep it compact at rest and let the
         # two data tables claim additional room only when the window grows.
-        self.setMinimumSize(900, 700)
         self._build_ui()
         self._disable_mouse_wheel_interaction()
         received_paths = take_media_paths()
@@ -296,27 +314,25 @@ class MediaInformationScreen(QWidget):
             "JSONは確定時に候補へ展開し、実在パスのようには扱いません。"
         )
         self.path_input.set_context_menu_augmenter(self._add_read_item_context_actions)
-        self.path_input.set_exclusive_context_menu_builder(self._build_rating_context_menu)
         self.path_input.selectionChanged.connect(self._show_current_operation_state)
         self.path_input.selectionChanged.connect(self._update_browse_status)
         self.path_input.rowSelectionChanged.connect(self._update_browse_status)
         self.path_input.itemClicked.connect(self._select_individual_row)
         self.path_input.itemDoubleClicked.connect(self._candidate_double_clicked)
-        self.path_input.set_supplemental_column_width("サイズ", 90)
-        self.path_input.set_supplemental_column_width("出所", 135)
-        self.path_input.set_supplemental_column_width("ファイル数", 70)
-        self.path_input.set_supplemental_column_width("メディア数", 70)
+        self.path_input.set_supplemental_column_sample("サイズ", "999.99 GiB")
+        self.path_input.set_supplemental_column_sample("出所", "フォルダから集約")
+        self.path_input.set_supplemental_column_sample("ファイル数", "999999")
+        self.path_input.set_supplemental_column_sample("メディア数", "999999")
         for label, _key in _MEDIA_ATTRIBUTE_COLUMNS:
-            self.path_input.set_supplemental_column_width(label, 130)
-        self.path_input.set_supplemental_column_width("サイズ", 90)
-        self.path_input.set_supplemental_column_width("拡張子", 75)
-        self.path_input.set_supplemental_column_width("解像度", 95)
-        self.path_input.set_supplemental_column_width("評価", 70)
-        self.path_input.set_supplemental_column_width("見どころ", 130)
-        self.path_input.set_supplemental_column_width(_RAW_ATTRIBUTES_COLUMN, 240)
-        self.path_input.set_supplemental_column_width("種別", 60)
+            self.path_input.set_supplemental_column_sample(label, "サンプル情報12文字")
+        self.path_input.set_supplemental_column_sample("拡張子", ".example")
+        self.path_input.set_supplemental_column_sample("解像度", "99999×99999")
+        self.path_input.set_supplemental_column_sample("評価", "★★★★★")
+        self.path_input.set_supplemental_column_sample("見どころ", "9999:59:59–9999:59:59")
+        self.path_input.set_supplemental_column_sample(_RAW_ATTRIBUTES_COLUMN, "JSON属性の要約サンプル文字列")
+        self.path_input.set_supplemental_column_sample("種別", "フォルダ")
         # 種別は表示する場合だけ、状態・除外の直前に固定する。
-        self.path_input.set_supplemental_column_fixed("種別", 60)
+        self.path_input.set_supplemental_column_fixed("種別")
         # The path, kind, state icon and removal control are structural.  The
         # optional fact columns alone are deliberately local settings.
         visible_columns = set(self._settings["default_visible_columns"])
@@ -326,6 +342,7 @@ class MediaInformationScreen(QWidget):
             self.path_input.set_supplemental_column_visible(
                 column_label, column_label in visible_columns
             )
+        self._sync_path_table_stretch_column()
         self.source_layout.addWidget(self.path_input, 1)
         source_actions_box = QWidget()
         source_actions_layout = QVBoxLayout(source_actions_box)
@@ -458,7 +475,6 @@ class MediaInformationScreen(QWidget):
         browse_tools.addLayout(browse_selection_row)
         source_actions_layout.addWidget(self.browse_tools_box)
         self.source_layout.addWidget(source_actions_box)
-        self.source_box.setMinimumHeight(250)
         layout.addWidget(self.source_box, 1)
 
         self.operation_box = QGroupBox("編集")
@@ -619,10 +635,7 @@ class MediaInformationScreen(QWidget):
         self.info_splitter.addWidget(notice_panel)
         self.info_splitter.setStretchFactor(0, 1)
         self.info_splitter.setStretchFactor(1, 2)
-        self.info_splitter.setSizes([320, 640])
         info_layout.addWidget(self.info_splitter)
-        self.info_box.setMinimumHeight(120)
-        self.info_box.setMaximumHeight(145)
         layout.addWidget(self.info_box)
 
         self.final_actions_box = QGroupBox("確認と保存")
@@ -651,6 +664,15 @@ class MediaInformationScreen(QWidget):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+        if (
+            watched is self.operation_value_input
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down}
+            and self._switch_value_operation_with_arrow(event.key())
+        ):
+            event.accept()
+            return True
         if event.type() == QEvent.Type.Wheel:
             current = watched if isinstance(watched, QWidget) else None
             while current is not None:
@@ -665,39 +687,73 @@ class MediaInformationScreen(QWidget):
             return True
         return super().eventFilter(watched, event)
 
+    def _switch_value_operation_with_arrow(self, key: Qt.Key) -> bool:
+        """Use up/down in the value editor to choose replace or append."""
+        target = "replace" if key == Qt.Key.Key_Up else "append"
+        index = self.operation_kind_combo.findData(target)
+        if index < 0:
+            return False
+        self.operation_kind_combo.setCurrentIndex(index)
+        return True
+
     def show_settings(self) -> None:
         """Show the saved JSON directly, so its only persistent value is visible."""
         dialog = QDialog(self)
         dialog.setWindowTitle("メディア情報整理の永続設定")
-        dialog.setMinimumSize(620, 360)
         layout = QVBoxLayout(dialog)
         state, detail = settings.settings_status()
         layout.addWidget(QLabel(f"設定状態: {state} — {detail}"))
         layout.addWidget(
             QLabel(
-                "保存するのは単一JSON読み込み時の保存先自動入力、右クリック用の登録パス、mpvキー・タグ候補、一覧の初期表示項目です。\n"
-                "auto_fill_single_json_path を true にすると、読み込んだJSONが1個だけのとき、そのJSONをパーツ保存先へ自動入力します。\n"
+                "保存するのは右クリック用の登録パス、mpvキー・タグ候補、一覧の初期表示項目です。\n"
+                "編集モードで読み込んだJSONが1個だけなら、そのJSONをパーツ保存先へ必ず自動入力します。\n"
                 "パーツ保存先そのものは永続設定へ保存しません。\n"
                 "mpv_path は、再生に使う mpv 実行ファイルの絶対パスです。既定値は /usr/bin/mpv です。\n"
-                "mpv_shortcuts は、アプリ連携キーと任意mpvキーを直接確認・編集できます。\n"
+                "mpv_shortcuts は末尾の中枢キーと任意mpvキーです。評価 1-10 の key_sequence は、標準の「1-9, 0」なら数字1〜9が評価1〜9、0が評価10です。別の割当は10個のキーをカンマ区切りで書けます。\n"
                 "mpv_tag_choices は、評価・タグ・見どころパッチ作成中に t で選べるタグ候補です。空の配列なら自由入力だけを使えます。\n"
                 "パス一覧、読取結果、編集履歴、ファイル情報、再生位置は保存しません。\n"
                 "状態・×は一覧の右端に常時表示します。default_visible_columns には、種別 / 出所 / サイズ / ファイル数 / メディア数 / 拡張子 / 解像度 / タグ / 評価 / 見どころ を配列で書けます。\n"
                 "パーツの新規保存は必ず新しいJSONを作り、上書きは今回読み込んだ単一パーツJSONにだけ許可します。"
             )
         )
-        editor = QTextEdit()
+        editor = JsonSettingsEditor(
+            validate=settings.validate_text,
+            path_keys={"registered_paths", "mpv_path"},
+            fields={
+                "registered_paths": JsonFieldSpec("右クリック用の登録パス", "メディアを選ぶ右クリック候補へ表示する場所です。"),
+                "mpv_path": JsonFieldSpec("MPVの場所", "動画再生に使うmpv実行ファイルです。"),
+                "mpv_tag_choices": JsonFieldSpec("タグ候補", "再生中に t を押したとき選べるタグです。"),
+                "_mpv_tag_choices_help": JsonFieldSpec("タグ候補の説明", read_only=True),
+                "default_visible_columns": JsonFieldSpec(
+                    "起動時に表示する列",
+                    "チェックした列を一覧へ表示します。表示順はアプリ側の固定順です。",
+                    choices=settings.DISPLAYABLE_PATH_COLUMNS,
+                ),
+                "mpv_shortcuts": JsonFieldSpec("MPVのキー設定", "PORTA連携キーと、追加のmpv操作キーです。"),
+                "任意mpvキー": JsonFieldSpec("任意のMPVキー", "必要な操作だけを追加・並べ替えできます。"),
+                "中枢キー": JsonFieldSpec("PORTA連携の中枢キー", "アプリの記録機能に必要な基本キーです。"),
+                "見どころ範囲": JsonFieldSpec("見どころ地点・範囲"),
+                "評価 1-10": JsonFieldSpec("評価 1–10"),
+                "タグを選ぶ": JsonFieldSpec("タグを選ぶ"),
+                "enabled": JsonFieldSpec("有効"),
+                "label": JsonFieldSpec("画面上の名前"),
+                "key": JsonFieldSpec("キー"),
+                "mpv_command": JsonFieldSpec("MPVコマンド"),
+                "start_key": JsonFieldSpec("開始キー"),
+                "end_key": JsonFieldSpec("終了キー"),
+                "key_sequence": JsonFieldSpec("評価キーの並び", "標準表記は 1-9, 0。個別指定は10個をカンマで区切ります。"),
+            },
+        )
         editor.setPlainText(settings.editable_text())
+        editor.set_source_state(state, detail)
         layout.addWidget(editor, 1)
         buttons = QDialogButtonBox()
         template_button = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
-        location_button = buttons.addButton("保存先入口", QDialogButtonBox.ButtonRole.ActionRole)
-        create_button = buttons.addButton("保存先・設定を作成", QDialogButtonBox.ButtonRole.ActionRole)
+        editor.bind_edit_button(template_button)
         save_button = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+        editor.bind_save_button(save_button)
         close_button = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
         template_button.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
-        location_button.clicked.connect(lambda: show_settings_location_editor(dialog))
-        create_button.clicked.connect(lambda: create_app_settings_file(dialog, settings.create_settings_file))
         save_button.clicked.connect(self.save_settings)
         close_button.clicked.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -715,13 +771,13 @@ class MediaInformationScreen(QWidget):
         except ValueError as exc:
             self._notify("永続設定を保存できません。", str(exc))
             return
-        if self._work_mode == "catalog" and self._settings["auto_fill_single_json_path"]:
+        if self._work_mode == "catalog":
             self._auto_fill_single_json_output_path()
         if self._settings_dialog is not None:
             self._settings_dialog.accept()
         self._notify(
             "永続設定を保存しました。",
-            "保存したのは単一JSON保存先の自動入力設定、登録パス、mpvキー・タグ候補、一覧の初期表示項目です。パーツ保存先は保存していません。",
+            "保存したのは登録パス、mpvキー・タグ候補、一覧の初期表示項目です。パーツ保存先は保存していません。",
         )
 
     def confirm_all_paths(self) -> None:
@@ -759,7 +815,6 @@ class MediaInformationScreen(QWidget):
         if (
             self._access_mode != "edit"
             or self._work_mode != "catalog"
-            or not self._settings["auto_fill_single_json_path"]
             or len(self._loaded_json_sources) != 1
         ):
             self._update_parts_overwrite_button()
@@ -992,7 +1047,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("仮登録を追加")
-        dialog.setMinimumWidth(460)
         layout = QVBoxLayout(dialog)
         layout.addWidget(
             QLabel(
@@ -1259,7 +1313,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("ファイルパスを今回だけ紐付ける")
-        dialog.setMinimumSize(780, 460)
         layout = QVBoxLayout(dialog)
         explanation = QLabel(
             "ファイルとフォルダを複数登録できます。フォルダは直下のファイルだけを使います。"
@@ -1375,6 +1428,24 @@ class MediaInformationScreen(QWidget):
             f"表示中・チェック済みの{len(paths)}件を独立したファイルマネージャーへ渡しました。"
         )
 
+    def _set_path_table_column_visible(self, label: str, visible: bool) -> None:
+        """Change one optional column and keep the table flush with its right edge."""
+        self.path_input.set_supplemental_column_visible(label, visible)
+        self._sync_path_table_stretch_column()
+
+    def _sync_path_table_stretch_column(self) -> None:
+        """Stretch the final visible fact, or the path when facts are all hidden."""
+        labels = (
+            "出所", "ファイル数", "メディア数", *(_ATTRIBUTE_KEY_FOR_COLUMN.keys()),
+            _RAW_ATTRIBUTES_COLUMN,
+        )
+        visible = [
+            label for label in labels
+            if self.path_input.supplemental_column_visible(label)
+        ]
+        self.path_input.set_stretch_supplemental_column(visible[-1] if visible else None)
+        self.path_input.set_path_column_stretch(not visible)
+
     def _add_read_item_context_actions(self, menu: QMenu, row: QTreeWidgetItem | None) -> None:
         """Add list collection, inspection and session-only column actions."""
         columns_menu = menu.addMenu("表示する項目")
@@ -1395,7 +1466,7 @@ class MediaInformationScreen(QWidget):
             elif label in _ATTRIBUTE_KEY_FOR_COLUMN:
                 action.setToolTip(f"{_ATTRIBUTE_KEY_FOR_COLUMN[label]} を表示します。")
             action.toggled.connect(
-                lambda visible, column_label=label: self.path_input.set_supplemental_column_visible(
+                lambda visible, column_label=label: self._set_path_table_column_visible(
                     column_label, visible
                 )
             )
@@ -1419,13 +1490,6 @@ class MediaInformationScreen(QWidget):
         item = self._media_item_for_tree_row(row)
         if item is None:
             return
-        if (
-            self._paths_locked
-            and self._access_mode == "edit"
-            and self._work_mode != "review_patch"
-        ):
-            rating_menu = menu.addMenu("評価")
-            self._add_rating_actions(rating_menu, item)
         if (
             self._paths_locked
             and self._access_mode == "edit"
@@ -1587,36 +1651,6 @@ class MediaInformationScreen(QWidget):
         target = path if path.is_dir() else path.parent
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
             self._notify(f"親フォルダを開く要求を送れませんでした。\n{target}")
-
-    def _build_rating_context_menu(
-        self, row: QTreeWidgetItem | None, column: int
-    ) -> QMenu | None:
-        """Use an uncluttered rating-only menu when the rating cell is clicked."""
-        if (
-            column != self.path_input.supplemental_column_index("評価")
-            or not self._paths_locked
-            or self._access_mode != "edit"
-            or self._work_mode == "review_patch"
-        ):
-            return None
-        item = self._media_item_for_tree_row(row)
-        if item is None:
-            return None
-        menu = QMenu(self.path_input)
-        self._add_rating_actions(menu, item)
-        return menu
-
-    def _add_rating_actions(self, menu: QMenu, source_item: MediaItem) -> None:
-        """Add the compact 0–10 rating choices shared by both context menus."""
-        for score in range(11):
-            stars = "★" * score + "☆" * (10 - score)
-            action = menu.addAction(f"{stars}  {score}/10")
-            action.setToolTip(f"このファイルの評価を {score}/10 にします。JSONへの書込みは「出力」時だけです。")
-            action.triggered.connect(
-                lambda _checked=False, selected_score=score, item=source_item: self._set_item_rating(
-                    item, selected_score
-                )
-            )
 
     def _set_item_rating(self, source_item: MediaItem, score: int) -> None:
         """Stage a one-item rating without touching its file or target JSON."""
@@ -1832,18 +1866,33 @@ class MediaInformationScreen(QWidget):
 
     def _refresh_operation_kind_choices(self, key: str) -> None:
         choices = self._allowed_operation_choices(key)
+        values = [value for _label, value in choices]
         current = str(self.operation_kind_combo.currentData() or "")
-        if [self.operation_kind_combo.itemData(index) for index in range(self.operation_kind_combo.count())] == [
-            value for _label, value in choices
-        ]:
+        field_changed = key != self._operation_kind_field_key
+        current_values = [
+            self.operation_kind_combo.itemData(index)
+            for index in range(self.operation_kind_combo.count())
+        ]
+        if current_values == values:
+            if field_changed and "append" in values:
+                self.operation_kind_combo.blockSignals(True)
+                self.operation_kind_combo.setCurrentIndex(self.operation_kind_combo.findData("append"))
+                self.operation_kind_combo.blockSignals(False)
+            self._operation_kind_field_key = key
             return
         self.operation_kind_combo.blockSignals(True)
         self.operation_kind_combo.clear()
         for label, value in choices:
             self.operation_kind_combo.addItem(label, value)
-        index = self.operation_kind_combo.findData(current)
-        self.operation_kind_combo.setCurrentIndex(index if index >= 0 else 0)
+        if field_changed and "append" in values:
+            index = self.operation_kind_combo.findData("append")
+        else:
+            index = self.operation_kind_combo.findData(current)
+            if index < 0:
+                index = 0
+        self.operation_kind_combo.setCurrentIndex(index)
         self.operation_kind_combo.blockSignals(False)
+        self._operation_kind_field_key = key
 
     def _update_operation_controls(self) -> None:
         selected_data = str(self.operation_field_combo.currentData() or "")
@@ -1996,7 +2045,11 @@ class MediaInformationScreen(QWidget):
                 # 評価は一覧上で素早く更新する操作があるため、ここだけは
                 # 読み取り値ではなく今回の出力予定値を表示する。
                 "評価": _catalog_value(planned, "review.score"),
-                "見どころ": _catalog_value(planned, "media.highlights"),
+                "見どころ": _catalog_value(
+                    planned,
+                    "media.highlights",
+                    precise_highlights=self._access_mode == "edit",
+                ),
             }
             session_notes = " / ".join(self._browse_session_notes.get(token, ()))
             if session_notes:
@@ -2221,8 +2274,12 @@ class MediaInformationScreen(QWidget):
             return
         field = catalog_field_for_key(key)
         field_label = field.label if field is not None else key
-        source_value = _catalog_value(source_item, key)
-        planned_value = _catalog_value(self._items[item_index], key)
+        source_value = _catalog_value(
+            source_item, key, precise_highlights=self._access_mode == "edit"
+        )
+        planned_value = _catalog_value(
+            self._items[item_index], key, precise_highlights=self._access_mode == "edit"
+        )
         self.selected_field_target_label.setText(
             f"対象: {display_name}　/　項目: {field_label}"
         )
@@ -2348,7 +2405,6 @@ class MediaInformationScreen(QWidget):
         """Show the complete field-by-field plan without writing anything."""
         dialog = QDialog(self)
         dialog.setWindowTitle("編集内容確認（まだ出力しません）")
-        dialog.setMinimumSize(760, 680)
         dialog_layout = QVBoxLayout(dialog)
         dialog_layout.addWidget(QLabel("反映済みの操作と、対象JSONへ出る項目を確認できます。"))
         report = QPlainTextEdit()
@@ -2368,7 +2424,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("出力予定の確認（まだ保存しません）")
-        dialog.setMinimumSize(760, 680)
         dialog_layout = QVBoxLayout(dialog)
         dialog_layout.addWidget(
             QLabel("チェック済みの候補について、現時点でJSONへ出る項目と値を表示します。")
@@ -2381,7 +2436,7 @@ class MediaInformationScreen(QWidget):
             record = catalog_record_from_media_item(item)
             lines.extend(("", f"{number}. {media_item_display_name(item)}"))
             lines.extend(
-                f"  {attribute.key}: {display_catalog_attribute(attribute)}"
+                f"  {attribute.key}: {display_catalog_attribute(attribute, precise_highlights=True)}"
                 for attribute in record.attributes
             )
         report.setPlainText("\n".join(lines))
@@ -2462,7 +2517,6 @@ class MediaInformationScreen(QWidget):
         )
         dialog = QDialog(self)
         dialog.setWindowTitle("パーツJSONの新規保存確認")
-        dialog.setMinimumSize(620, 270)
         layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)
@@ -2553,7 +2607,6 @@ class MediaInformationScreen(QWidget):
     def _confirm_overwrite(self, report_text: str, *, title: str) -> bool:
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
-        dialog.setMinimumSize(700, 390)
         layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)
@@ -2627,7 +2680,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("項目更新パッチの保存先")
-        dialog.setMinimumSize(680, 260)
         layout = QVBoxLayout(dialog)
         field = catalog_field_for_key(patch.field_key)
         field_label = field.label if field is not None else patch.field_key
@@ -2678,7 +2730,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("項目更新パッチを結合")
-        dialog.setMinimumSize(700, 220)
         layout = QVBoxLayout(dialog)
         layout.addWidget(
             QLabel(
@@ -2715,7 +2766,6 @@ class MediaInformationScreen(QWidget):
         field_label = field.label if field is not None else patch.field_key
         dialog = QDialog(self)
         dialog.setWindowTitle("項目更新パッチの照合結果")
-        dialog.setMinimumSize(700, 390)
         layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)
@@ -2798,7 +2848,6 @@ class MediaInformationScreen(QWidget):
             return
         dialog = QDialog(self)
         dialog.setWindowTitle("評価・見どころパッチを結合")
-        dialog.setMinimumSize(700, 210)
         layout = QVBoxLayout(dialog)
         layout.addWidget(
             QLabel(
@@ -2836,7 +2885,6 @@ class MediaInformationScreen(QWidget):
         self._review_patch_report_text = review_patch_merge_summary(plan, patch)
         dialog = QDialog(self)
         dialog.setWindowTitle("評価・見どころパッチの照合結果")
-        dialog.setMinimumSize(700, 380)
         layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)
@@ -2956,7 +3004,6 @@ class MediaInformationScreen(QWidget):
         value_count = sum(len(entry.attributes) for entry in patch.entries)
         dialog = QDialog(self)
         dialog.setWindowTitle("評価・見どころパッチの出力確認")
-        dialog.setMinimumSize(640, 300)
         dialog_layout = QVBoxLayout(dialog)
         report = QPlainTextEdit()
         report.setReadOnly(True)
@@ -3002,7 +3049,6 @@ class MediaInformationScreen(QWidget):
         """Review patches are immutable output snapshots, never overwrite files."""
         dialog = QDialog(self)
         dialog.setWindowTitle("既存の評価・見どころパッチがあります")
-        dialog.setMinimumSize(580, 220)
         layout = QVBoxLayout(dialog)
         message = QLabel(
             "指定した .json は既に存在します。評価・見どころパッチは後で照合して使う独立した記録のため、"
@@ -3030,7 +3076,6 @@ class MediaInformationScreen(QWidget):
             return None
         dialog = QDialog(self)
         dialog.setWindowTitle("既存の評価・見どころパッチがあります")
-        dialog.setMinimumSize(620, 240)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f"保存先: {output}\n\n保存方法を明示的に選んでください。"))
         buttons = QDialogButtonBox()
@@ -3174,7 +3219,6 @@ class MediaInformationScreen(QWidget):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("mpv連携動画をファイル名で紐付け")
-        dialog.setMinimumSize(980, 520)
         layout = QVBoxLayout(dialog)
         explanation = QLabel(
             "左のチェック済み候補と、右へ追加する実動画をファイル名で完全一致照合します。"
@@ -3320,7 +3364,6 @@ class MediaInformationScreen(QWidget):
         )
         dialog = QDialog(self)
         dialog.setWindowTitle("mpvショートカット一覧")
-        dialog.setMinimumSize(700, 510)
         layout = QVBoxLayout(dialog)
         layout.addWidget(
             QLabel(
@@ -3351,10 +3394,55 @@ class MediaInformationScreen(QWidget):
             )
         )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_to_normal_mpv = buttons.addButton(
+            "通常のmpvへ使える設定を追加…", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        copy_to_normal_mpv.setToolTip(
+            "普段起動するmpvで、開いたファイルのフォルダをプレイリストにする設定と、"
+            "PORTA連携を必要としないキーだけを追記します。既存の同名設定・キーは変更しません。"
+        )
+        copy_to_normal_mpv.clicked.connect(self.copy_porta_settings_to_normal_mpv)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def copy_porta_settings_to_normal_mpv(self) -> None:
+        """Offer an opt-in, non-destructive bridge to a user's normal mpv."""
+        answer = QMessageBox.question(
+            self,
+            "通常のmpvへ設定を追加",
+            "普段起動するmpvの設定フォルダへ、PORTA管理の追記欄を作ります。\n\n"
+            "・既存のmpv.conf / input.conf は消しません\n"
+            "・同じ設定名やキーを既に使っている場合は、その既存設定を優先します\n"
+            "・通常のローカルファイルを開くと、同じフォルダの対応メディアをプレイリストにします\n"
+            "・通常のメディアを開くたび、前回PORTA経由で開いた通常mpvだけを終了して置き換えます\n"
+            "・評価、タグ、見どころ記録、押している間だけ2倍速は追加しません\n"
+            "・次回実行時はPORTAの追記欄だけを更新します\n\n"
+            "追加しますか？",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        self._settings = settings.load_settings()
+        try:
+            result = copy_porta_settings_to_normal_mpv(self._settings["mpv_shortcuts"])
+            handler = install_normal_mpv_replace_handler()
+        except ValueError as exc:
+            self._notify("通常のmpv設定を追加できません。", str(exc))
+            return
+        lines = [
+            "通常のmpvへ、PORTAと共通で使える設定を追加しました。",
+            f"設定フォルダ: {result.config_directory}",
+            f"フォルダプレイリスト設定: {len(result.copied_options)}件追加 / {len(result.skipped_options)}件は既存設定を優先",
+            f"キー: {len(result.copied_bindings)}件追加 / {len(result.skipped_bindings)}件は既存キーを優先",
+            f"置換起動: {len(handler.configured_mime_types)}種類を通常の開き方へ登録",
+            "評価・タグ・見どころ記録・長押し2倍速は、PORTA連携が必要なため追加していません。",
+        ]
+        if handler.failed_mime_types:
+            lines.append("一部の種類は既定の開き方へ登録できませんでした: " + ", ".join(handler.failed_mime_types))
+        self._notify(*lines)
 
     def _launch_mpv_playlist(self, paths: tuple[Path, ...], *, playlist_start_index: int = 0) -> None:
         playable = tuple(path for path in paths if path.is_file())
@@ -3378,7 +3466,14 @@ class MediaInformationScreen(QWidget):
             self._notify("mpvで再生できません。", str(exc))
             return
 
+        try:
+            replacement = begin_mpv_replacement("porta")
+        except (OSError, RuntimeError, ValueError) as exc:
+            session.cleanup()
+            self._notify("前回のPORTA用mpvを終了できません。", str(exc))
+            return
         process = QProcess(self)
+        track_qprocess(process, 'mpv再生')
         environment = QProcessEnvironment.systemEnvironment()
         for name, value in session.environment().items():
             environment.insert(name, value)
@@ -3393,12 +3488,33 @@ class MediaInformationScreen(QWidget):
             lambda _error, player=process: self._report_mpv_error(player)
         )
         process.start()
+        if not process.waitForStarted(3000):
+            replacement.close()
+            # errorOccurred normally handles cleanup.  Some platform plugins
+            # report only the failed wait, so keep the temporary session safe.
+            if process in self._mpv_sessions:
+                self._report_mpv_error(process)
+            return
+        try:
+            owner_pid = int(process.processId())
+            replacement.claim(owner_pid)
+            self._mpv_owner_pids[process] = owner_pid
+        except (OSError, ValueError) as exc:
+            process.terminate()
+            self._mpv_sessions.pop(process, None)
+            session.cleanup()
+            self._notify("PORTA用mpvの識別情報を保存できません。", str(exc))
+            return
+        finally:
+            replacement.close()
         self._mpv_event_timer.start()
         lines = [
             "mpvをRAM上の一時設定で起動しました。",
             f"再生: {len(playable)}件（一覧順のプレイリスト）",
             f"実行ファイル: {session.program}",
-            "[: コメントあり範囲開始 / ]: コメント入力して記録 / /: コメントなし範囲開始 / \\: コメントなしで記録 / →長押し: キーフレーム送り / m: 見どころ / c: 見どころメモ / n: 次の動画",
+            "[: 見どころ範囲開始 / ]: コメント入力して記録（同時刻なら地点） / "
+            "→長押し: キーフレーム送り / 「:」長押し: 2倍速 / "
+            "n: 次の動画",
         ]
         if self._access_mode == "edit":
             lines.append("1〜9、0: 評価1〜10。反映先は今回の出力予定のみです。")
@@ -3415,6 +3531,8 @@ class MediaInformationScreen(QWidget):
         )
 
     def _finish_mpv_session(self, process: QProcess, exit_code: int) -> None:
+        if (owner_pid := self._mpv_owner_pids.pop(process, 0)):
+            release_owned_mpv("porta", owner_pid)
         session = self._mpv_sessions.pop(process, None)
         if session is not None:
             for event in session.read_events():
@@ -3424,6 +3542,8 @@ class MediaInformationScreen(QWidget):
                 for key, value in self._mpv_pending_ranges.items()
                 if key[0] != str(session.directory)
             }
+            if self._mpv_tag_session is session and self._mpv_tag_dialog is not None:
+                self._mpv_tag_dialog.reject()
             session.cleanup()
         if not self._mpv_sessions:
             self._mpv_event_timer.stop()
@@ -3431,8 +3551,12 @@ class MediaInformationScreen(QWidget):
             self._notify("mpvが通常終了しませんでした。", f"終了コード: {exit_code}")
 
     def _report_mpv_error(self, process: QProcess) -> None:
+        if (owner_pid := self._mpv_owner_pids.pop(process, 0)):
+            release_owned_mpv("porta", owner_pid)
         session = self._mpv_sessions.pop(process, None)
         if session is not None:
+            if self._mpv_tag_session is session and self._mpv_tag_dialog is not None:
+                self._mpv_tag_dialog.reject()
             session.cleanup()
         if not self._mpv_sessions:
             self._mpv_event_timer.stop()
@@ -3460,11 +3584,16 @@ class MediaInformationScreen(QWidget):
             if 1 <= score <= 10:
                 self._set_item_rating(source_item, score)
             return
-        if event.kind == "highlight_point":
-            self._append_player_highlight(index, _mpv_time_text(event.time_seconds), "", "見どころ地点")
-            return
         if event.kind == "tag_selection":
-            self._request_player_tag(index)
+            self._request_player_tag(session, index)
+            return
+        if event.kind == "tag_navigation":
+            if self._mpv_tag_session is session:
+                self._navigate_player_tag(-1 if event.value == "-1" else 1)
+            return
+        if event.kind == "tag_accept":
+            if self._mpv_tag_session is session:
+                self._accept_player_tag()
             return
         mpv_path = self._mpv_path_for_item(source_item)
         if mpv_path is None:
@@ -3480,23 +3609,7 @@ class MediaInformationScreen(QWidget):
                 self._notify("先に「見どころ範囲の開始」を押してください。")
                 return
             beginning, end = sorted((start, event.time_seconds))
-            self._request_highlight_range_comment(session, index, beginning, end)
-            return
-        if event.kind == "highlight_range_end_no_comment":
-            start = self._mpv_pending_ranges.pop(range_key, None)
-            if start is None:
-                self._notify("先に「見どころ範囲の開始」を押してください。")
-                return
-            beginning, end = sorted((start, event.time_seconds))
-            self._append_player_highlight(
-                index,
-                f"{_mpv_time_text(beginning)}-{_mpv_time_text(end)}",
-                "",
-                "見どころ範囲",
-            )
-            return
-        if event.kind == "highlight_comment":
-            self._request_highlight_comment(session, index, event.time_seconds)
+            self._request_highlight_range_or_point_comment(session, index, beginning, end)
             return
 
     def _media_item_index_for_mpv_path(self, value: str) -> int | None:
@@ -3558,7 +3671,9 @@ class MediaInformationScreen(QWidget):
             self._append_browse_session_note(index, detail or label)
             return
         try:
-            proposed = append_media_highlight(self._items[index], time=time, comment=comment)
+            proposed, replaced_count = append_mpv_highlight_replacing_overlaps(
+                self._items[index], time=time, comment=comment
+            )
         except ValueError as exc:
             self._notify(f"{label}を反映できません。", str(exc))
             return
@@ -3576,6 +3691,11 @@ class MediaInformationScreen(QWidget):
                 item_name=media_item_display_name(source_item),
             )
         )
+        replacement_detail = (
+            f"重なった既存見どころ {replaced_count} 件を置き換えました。"
+            if replaced_count
+            else ""
+        )
         self._applied_operation_summaries.append(
             f"{media_item_display_name(source_item)}: {label} {time}"
         )
@@ -3583,7 +3703,7 @@ class MediaInformationScreen(QWidget):
         detail = f"{time} {comment}".strip()
         self._notify(
             f"{media_item_display_name(source_item)} に{label}を反映しました。",
-            f"{detail}。実ファイル・JSONはまだ変更していません。",
+            f"{detail}。{replacement_detail} 実ファイル・JSONはまだ変更していません。".strip(),
         )
 
     def _append_player_tag(self, index: int, value: str) -> bool:
@@ -3621,22 +3741,22 @@ class MediaInformationScreen(QWidget):
             f"{text}。元JSON・ファイルは変更していません。",
         )
 
-    def _request_player_tag(self, index: int) -> None:
+    def _request_player_tag(self, session: IsolatedMpvSession, index: int) -> None:
         """Open a transient chooser for the registered tags or one free entry."""
         if self._mpv_tag_dialog is not None:
+            session.finish_tag_selection()
             self._notify("タグの選択画面はすでに開いています。")
             return
         source_item = self._source_items[index]
         dialog = QDialog()
         dialog.setWindowTitle("タグを追加")
-        dialog.setModal(False)
+        dialog.setModal(True)
         dialog.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        dialog.setMinimumWidth(440)
         layout = QVBoxLayout(dialog)
         title = QLabel(f"{media_item_display_name(source_item)} に付けるタグ")
         layout.addWidget(title)
         description = QLabel(
-            "登録済みの候補から選ぶか、ここへ自由に入力してください。"
+            "↑↓で登録済み候補を選び、Enterで追加できます。自由入力も可能です。"
             "同じタグは追加しません。"
         )
         description.setWordWrap(True)
@@ -3651,6 +3771,7 @@ class MediaInformationScreen(QWidget):
         layout.addWidget(choices)
         buttons = QDialogButtonBox(dialog)
         add_button = buttons.addButton("タグを追加", QDialogButtonBox.ButtonRole.AcceptRole)
+        add_button.setDefault(True)
         buttons.addButton("中止", QDialogButtonBox.ButtonRole.RejectRole).clicked.connect(dialog.reject)
         layout.addWidget(buttons)
 
@@ -3663,60 +3784,54 @@ class MediaInformationScreen(QWidget):
         def forget_dialog() -> None:
             if self._mpv_tag_dialog is dialog:
                 self._mpv_tag_dialog = None
+                self._mpv_tag_choices = None
+                self._mpv_tag_accept = None
+                self._mpv_tag_session = None
+                session.finish_tag_selection()
             dialog.deleteLater()
 
         add_button.clicked.connect(add_tag)
+        if choices.lineEdit() is not None:
+            choices.lineEdit().returnPressed.connect(add_tag)
         dialog.finished.connect(lambda _result: forget_dialog())
         self._mpv_tag_dialog = dialog
-        dialog.show()
-        choices.setFocus()
+        self._mpv_tag_choices = choices
+        self._mpv_tag_accept = add_tag
+        self._mpv_tag_session = session
 
-    def _request_highlight_comment(
-        self, session: IsolatedMpvSession, index: int, seconds: float
-    ) -> None:
-        if self._mpv_comment_dialog is not None:
-            self._notify("見どころメモの入力欄はすでに開いています。")
+        def focus_tag_choices() -> None:
+            if self._mpv_tag_dialog is not dialog:
+                return
+            dialog.raise_()
+            dialog.activateWindow()
+            choices.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+            if choices.count():
+                choices.showPopup()
+
+        dialog.show()
+        QTimer.singleShot(0, focus_tag_choices)
+
+    def _navigate_player_tag(self, offset: int) -> None:
+        """Move the visible choice even when Up/Down physically reached mpv."""
+        choices = self._mpv_tag_choices
+        if choices is None or not choices.count():
             return
-        source_item = self._source_items[index]
-        dialog = QInputDialog()
-        dialog.setWindowTitle("見どころメモ")
-        dialog.setLabelText(f"{media_item_display_name(source_item)} / {_mpv_time_text(seconds)}")
-        dialog.setInputMode(QInputDialog.InputMode.TextInput)
-        dialog.setTextEchoMode(QLineEdit.EchoMode.Normal)
-        dialog.setModal(False)
-        dialog.setWindowFlags(
-            Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
-        )
-        dialog.setMinimumWidth(440)
+        current = choices.currentIndex()
+        if current < 0:
+            target = 0 if offset > 0 else choices.count() - 1
+        else:
+            target = (current + offset) % choices.count()
+        choices.setCurrentIndex(target)
 
-        def save_comment() -> None:
-            value = dialog.textValue().strip()
-            if value:
-                self._append_player_highlight(
-                    index, _mpv_time_text(seconds), value, "見どころコメント"
-                )
-                if not session.request_resume():
-                    self._notify("見どころメモは反映しましたが、mpvへ再生再開を送れませんでした。")
+    def _accept_player_tag(self) -> None:
+        """Accept Enter relayed from mpv while the chooser owns the workflow."""
+        if self._mpv_tag_accept is not None:
+            self._mpv_tag_accept()
 
-        def forget_dialog() -> None:
-            if self._mpv_comment_dialog is dialog:
-                self._mpv_comment_dialog = None
-            dialog.deleteLater()
-
-        dialog.accepted.connect(save_comment)
-        dialog.finished.connect(lambda _result: forget_dialog())
-        self._mpv_comment_dialog = dialog
-        dialog.show()
-        # This is only a request to focus the small transient dialog.  Once it
-        # closes, a Wayland compositor may return focus to the prior mpv window;
-        # we deliberately do not try to force-focus another application.
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _request_highlight_range_comment(
+    def _request_highlight_range_or_point_comment(
         self, session: IsolatedMpvSession, index: int, beginning: float, end: float
     ) -> None:
-        """Ask for the comment when a bracketed highlight range is completed.
+        """Ask for a comment when a bracketed highlight point/range is completed.
 
         Tag choices are only a convenient comment preset. Nothing selected
         here changes the item's tags. Nothing is persisted until the normal
@@ -3726,17 +3841,19 @@ class MediaInformationScreen(QWidget):
             self._notify("見どころコメントの入力欄はすでに開いています。")
             return
         source_item = self._source_items[index]
-        time_range = f"{_mpv_time_text(beginning)}-{_mpv_time_text(end)}"
+        stored_time = _mpv_highlight_time_text(beginning, end)
+        is_point = "-" not in stored_time
+        kind_label = "見どころ地点" if is_point else "見どころ範囲"
         dialog = QDialog()
-        dialog.setWindowTitle("見どころ範囲のコメント")
+        dialog.setWindowTitle(f"{kind_label}のコメント")
         dialog.setModal(False)
         dialog.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
-        dialog.setMinimumWidth(440)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"{media_item_display_name(source_item)} / {time_range}"))
+        layout.addWidget(QLabel(f"{media_item_display_name(source_item)} / {stored_time}"))
         description = QLabel(
             "コメントを選択または入力してください。候補はタグ用設定を流用しますが、"
-            "ここで選んだ内容はコメントとしてだけ記録します。空欄のままでも時間範囲だけ記録できます。"
+            "ここで選んだ内容はコメントとしてだけ記録します。"
+            + ("空欄のままでも地点だけ記録できます。" if is_point else "空欄のままでも時間範囲だけ記録できます。")
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -3755,7 +3872,7 @@ class MediaInformationScreen(QWidget):
 
         def save_range() -> None:
             comment = choices.currentText().strip()
-            self._append_player_highlight(index, time_range, comment, "見どころ範囲")
+            self._append_player_highlight(index, stored_time, comment, kind_label)
             if not session.request_resume():
                 self._notify("見どころは反映しましたが、mpvへ再生再開を送れませんでした。")
             dialog.accept()

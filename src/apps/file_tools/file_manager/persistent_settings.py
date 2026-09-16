@@ -6,14 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, TypedDict
 
-from foundation.json_settings import (
-    atomic_write_json,
-    create_app_settings_file,
-    editable_settings_text,
-    settings_destination,
-    validated_settings_status,
-)
-from foundation.path_tokens import expand_setting_path, home_tokenized
+from settings.json_settings import atomic_write_json, create_app_settings_file, editable_settings_text, settings_destination, validated_settings_status
+from settings.persistent_settings import config_path_text, resolve_config_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 SETTINGS_FILE_NAME = "file_manager.json"
@@ -133,16 +127,16 @@ def validate_text(text: str) -> dict[str, list[FavoritePath]]:
             raise ValueError(f"favorite_paths の {index} 件目の path は文字列にしてください。")
         if not all(isinstance(item[key], bool) for key in required - {"path"}):
             raise ValueError(f"favorite_paths の {index} 件目の属性は true または false にしてください。")
-        path_text = raw_path.strip()
+        path_text = raw_path
         # Empty slots are intentional: the editable template provides five
         # stable rows, while only rows with an actual path affect the UI.
         if not path_text:
             continue
-        expanded = expand_setting_path(path_text)
+        expanded = resolve_config_path(path_text)
         candidate = Path(expanded)
         if "\x00" in expanded or not candidate.is_absolute():
             raise ValueError(
-                f"favorite_paths の {index} 件目は @HOME、~、または / から始まるパスにしてください。"
+                f"favorite_paths の {index} 件目は共通パス記法または絶対パスにしてください。"
             )
         if expanded in seen:
             raise ValueError(f"favorite_paths に同じパスが重複しています: {expanded}")
@@ -169,11 +163,11 @@ def _migrate_legacy_settings(raw: dict[str, Any]) -> dict[str, list[FavoritePath
         if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
             raise ValueError(f"{key} は文字列の配列にしてください。")
         for raw_path in values:
-            if not raw_path.strip():
+            if not raw_path:
                 continue
-            expanded = expand_setting_path(raw_path.strip())
+            expanded = resolve_config_path(raw_path)
             if "\x00" in expanded or not Path(expanded).is_absolute():
-                raise ValueError(f"{key} は @HOME、~、または / から始まるパスにしてください。")
+                raise ValueError(f"{key} は共通パス記法または絶対パスにしてください。")
             entry = by_path.setdefault(
                 expanded,
                 FavoritePath(
@@ -189,7 +183,7 @@ def _migrate_legacy_settings(raw: dict[str, Any]) -> dict[str, list[FavoritePath
     return {
         "favorite_paths": [
             FavoritePath(
-                path=expand_setting_path(entry["path"]),
+                path=resolve_config_path(entry["path"]),
                 initial_work_list=entry["initial_work_list"],
                 favorite=entry["favorite"],
                 context_menu=entry["context_menu"],
@@ -211,10 +205,10 @@ def save_text(text: str) -> dict[str, list[FavoritePath]]:
         saved_entries = []
         for entry in raw_entries:
             assert isinstance(entry, dict)
-            path_text = entry["path"].strip()
+            path_text = entry["path"]
             saved_entries.append(
                 {
-                    "path": home_tokenized(expand_setting_path(path_text)) if path_text else "",
+                    "path": config_path_text(resolve_config_path(path_text)) if path_text else "",
                     "initial_work_list": entry["initial_work_list"],
                     "favorite": entry["favorite"],
                     "context_menu": entry["context_menu"],
@@ -223,7 +217,7 @@ def save_text(text: str) -> dict[str, list[FavoritePath]]:
     else:
         saved_entries = [
             {
-                "path": home_tokenized(entry["path"]),
+                "path": config_path_text(entry["path"]),
                 "initial_work_list": entry["initial_work_list"],
                 "favorite": entry["favorite"],
                 "context_menu": entry["context_menu"],

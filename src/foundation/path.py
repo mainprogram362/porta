@@ -6,15 +6,28 @@ PathLike = str | Path
 
 
 def clean_path(path: PathLike) -> Path:
+    """Make a path without changing any character in its name.
+
+    POSIX permits leading and trailing whitespace (and quote characters) in a
+    file name.  A path helper is used at the filesystem boundary, so it must
+    not treat those characters as input decoration.  UI fields that want to
+    trim a free-form search word must do so before calling this function.
     """
-    パス文字列から余分な前後の空白、ダブルクォート、シングルクォートを
-    完全に削ぎ落として Path 化する
+    return Path(os.fspath(path)).expanduser()
+
+
+def path_text_from_input(value: str) -> str:
+    """Keep literal whitespace, except for an unambiguous pasted-path wrapper.
+
+    A pasted `` /path/file `` has historically been accepted as ``/path/file``.
+    Retain that convenience only when the literal form does *not* exist and
+    the trimmed form already does.  Thus an existing ``file `` is never
+    silently changed into ``file``.
     """
-    s = str(path).strip()
-    # 前後のクォートが残っている場合を考慮して何度か strip する
-    s = s.strip("\"'")
-    # パス内部の不意な余白やゴミを取り除くため、再度ストリップ
-    return Path(s.strip()).expanduser()
+    trimmed = value.strip()
+    if value != trimmed and trimmed and not path_entry_exists(value) and path_entry_exists(trimmed):
+        return trimmed
+    return value
 
 
 def absolute_path(path: PathLike) -> Path:
@@ -95,7 +108,7 @@ def join_paths(base_path: PathLike, *sub_paths: PathLike) -> Path:
     res = clean_path(base_path)
     for sub in sub_paths:
         # 先頭の斜線を剥がして相対パス化して結合
-        sub_str = str(sub).strip("'\"").lstrip("/\\")
+        sub_str = os.fspath(sub).lstrip("/\\")
         res = res / sub_str
     return res
 

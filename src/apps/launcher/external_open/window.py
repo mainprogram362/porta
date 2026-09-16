@@ -18,10 +18,14 @@ from PySide6.QtWidgets import (
 from apps.file_tools.file_manager.extract_workflow import is_supported_archive_path
 from foundation.external_open import ExternalOpenIntent
 from gui import AppHeader, AppPageLayout
+from gui.layout_policy import set_text_rows
 
 
 class ExternalOpenChooserScreen(QWidget):
     """Display one non-persistent routing decision after common validation."""
+
+    def describe_work_state(self):
+        return {"level": 3, "reason": "外部アプリから受け取ったパスを保持しています。"}
 
     def __init__(
         self,
@@ -32,10 +36,10 @@ class ExternalOpenChooserScreen(QWidget):
         super().__init__()
         self.paths = paths
         self._choose = choose
-        self.setMinimumSize(760, 560)
 
         layout = AppPageLayout(self)
-        layout.addWidget(AppHeader(cancel, title="受け取ったパスの操作"))
+        header = AppHeader(cancel, title="受け取ったパスの操作")
+        layout.addWidget(header)
         explanation = QLabel(
             f"外部ファイルマネージャーから{len(paths)}件を受け取り、全件の入口検査に通りました。"
             "ここでは実ファイルを変更しません。次に行う操作を選んでください。"
@@ -47,7 +51,7 @@ class ExternalOpenChooserScreen(QWidget):
         received_layout = QVBoxLayout(received_box)
         received = QPlainTextEdit("\n".join(str(path) for path in paths))
         received.setReadOnly(True)
-        received.setMinimumHeight(130)
+        set_text_rows(received, minimum=6)
         received_layout.addWidget(received)
         layout.addWidget(received_box)
 
@@ -127,7 +131,6 @@ class ExternalOpenChooserScreen(QWidget):
         action: str,
     ) -> QPushButton:
         button = QPushButton(f"{title}\n{description}")
-        button.setMinimumHeight(62)
         button.clicked.connect(
             lambda _checked=False: self._choose(
                 ExternalOpenIntent(target=target, action=action, paths=self.paths)  # type: ignore[arg-type]

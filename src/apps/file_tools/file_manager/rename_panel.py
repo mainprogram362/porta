@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -19,6 +20,8 @@ from PySide6.QtWidgets import (
 
 from apps.file_tools.file_manager.rename_workflow import RenameRule
 from gui import NoWheelComboBox
+from gui.flow_layout import FlowLayout
+from gui.layout_policy import set_item_view_rows
 
 
 class RenamePanel(QWidget):
@@ -61,45 +64,53 @@ class RenamePanel(QWidget):
         self.rule_kind_combo.addItem("末尾から削除", "trim_end")
         self.rule_kind_combo.addItem("文字列を削除", "remove_text")
         self.rule_kind_combo.addItem("文字列を置換", "replace")
-        self.rule_kind_combo.setMinimumWidth(140)
+        self.rule_kind_combo.addItem("名前内の空白をすべて削除", "remove_spaces")
+        self.rule_kind_combo.addItem("全角を半角へ統一…", "normalize_width")
         settings.addWidget(self.rule_kind_combo, 1)
         layout.addLayout(settings)
 
-        fields = QHBoxLayout()
+        fields = FlowLayout()
         self.first_label = QLabel()
         fields.addWidget(self.first_label)
         self.first_spin = QSpinBox()
         self.first_spin.setRange(0, 1_000_000)
-        self.first_spin.setMinimumWidth(68)
         fields.addWidget(self.first_spin)
         self.second_label = QLabel()
         fields.addWidget(self.second_label)
         self.second_spin = QSpinBox()
         self.second_spin.setRange(0, 1_000_000)
-        self.second_spin.setMinimumWidth(68)
         fields.addWidget(self.second_spin)
         self.text_input = QLineEdit()
-        self.text_input.setMinimumWidth(130)
-        fields.addWidget(self.text_input, 1)
+        fields.addWidget(self.text_input)
         self.replacement_input = QLineEdit()
-        self.replacement_input.setMinimumWidth(130)
-        fields.addWidget(self.replacement_input, 1)
+        fields.addWidget(self.replacement_input)
         self.add_rule_button = QPushButton("ルールを追加")
-        self.add_rule_button.setMinimumWidth(96)
         self.add_rule_button.clicked.connect(self.add_rule)
         fields.addWidget(self.add_rule_button)
         layout.addLayout(fields)
 
+        self.width_options = QWidget()
+        width_layout = QHBoxLayout(self.width_options)
+        width_layout.setContentsMargins(0, 0, 0, 0)
+        width_layout.addWidget(QLabel("半角にするもの"))
+        self.width_letters = QCheckBox("英字")
+        self.width_digits = QCheckBox("数字")
+        self.width_symbols = QCheckBox("記号")
+        for checkbox in (self.width_letters, self.width_digits, self.width_symbols):
+            checkbox.setChecked(True)
+            width_layout.addWidget(checkbox)
+        self.width_options.setToolTip("初期状態はすべて。Ａ→A、１→1、！→!。ーは変更しません。")
+        width_layout.addStretch(1)
+        layout.addWidget(self.width_options)
+
         self.rule_list = QListWidget()
-        self.rule_list.setFixedHeight(72)
+        set_item_view_rows(self.rule_list, minimum=2, maximum=4, header=False)
         layout.addWidget(self.rule_list)
         actions = QHBoxLayout()
         delete_button = QPushButton("選択を削除")
-        delete_button.setMinimumWidth(92)
         delete_button.clicked.connect(self.delete_selected_rule)
         actions.addWidget(delete_button)
         clear_button = QPushButton("全て空にする")
-        clear_button.setMinimumWidth(104)
         clear_button.clicked.connect(self.clear_rules)
         actions.addWidget(clear_button)
         layout.addLayout(actions)
@@ -111,8 +122,11 @@ class RenamePanel(QWidget):
         self.preview_tree = QTreeWidget()
         self.preview_tree.setHeaderLabels(("変更前のファイル名", "変更後のファイル名"))
         self.preview_tree.setRootIsDecorated(False)
-        self.preview_tree.setMinimumHeight(150)
-        self.preview_tree.setColumnWidth(0, 260)
+        set_item_view_rows(self.preview_tree, minimum=4)
+        self.preview_tree.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.preview_tree.header().setStretchLastSection(False)
+        self.preview_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.preview_tree.header().setResizeContentsPrecision(-1)
         layout.addWidget(self.preview_tree, 1)
         self.set_preview((), "リネーム規則を追加すると、ここに変更予定を表示します。")
 
@@ -159,6 +173,7 @@ class RenamePanel(QWidget):
         self.first_spin.setVisible(uses_first)
         self.second_label.setVisible(uses_second)
         self.second_spin.setVisible(uses_second)
+        self.width_options.setVisible(kind == "normalize_width")
         self.first_label.setText(
             "位置" if kind == "insert" else "開始" if kind == "remove_range" else "文字数"
         )
@@ -190,6 +205,9 @@ class RenamePanel(QWidget):
             first=self.first_spin.value(),
             second=self.second_spin.value(),
             use_regex=self.regex_checkbox.isChecked() if kind in {"remove_text", "replace"} else False,
+            width_letters=self.width_letters.isChecked(),
+            width_digits=self.width_digits.isChecked(),
+            width_symbols=self.width_symbols.isChecked(),
         )
         self._rules.append(rule)
         self.text_input.clear()
@@ -231,6 +249,8 @@ class RenamePanel(QWidget):
         self.second_spin.setValue(0)
         self.text_input.clear()
         self.replacement_input.clear()
+        for checkbox in (self.width_letters, self.width_digits, self.width_symbols):
+            checkbox.setChecked(True)
         self._rules.clear()
         self._refresh_rule_list()
         self._set_status("")
@@ -264,6 +284,17 @@ def _describe_rule(rule: RenameRule) -> str:
     if rule.kind == "replace":
         prefix = "正規表現 " if rule.use_regex else ""
         return f"{prefix}「{rule.text}」を「{rule.replacement}」へ置換"
+    if rule.kind == "remove_spaces":
+        return "名前内の空白をすべて削除"
+    if rule.kind == "normalize_width":
+        groups = []
+        if rule.width_letters:
+            groups.append("英字")
+        if rule.width_digits:
+            groups.append("数字")
+        if rule.width_symbols:
+            groups.append("記号")
+        return "全角を半角へ統一（" + "・".join(groups or ["対象なし"]) + "）"
     return f"末尾から{rule.first}文字を削除"
 
 

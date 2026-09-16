@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from html import escape
 from pathlib import Path
 from typing import Literal
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QEvent, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QLineEdit, QMenu, QTextEdit
+from PySide6.QtWidgets import QLineEdit, QMenu, QTextEdit, QToolTip
 
-from foundation.path import normalize_path
+from foundation.path import normalize_path, path_text_from_input
 
 from .path_support import (
     directory_for_path,
     local_paths_from_mime,
     open_in_standard_file_manager,
 )
+from ..layout_policy import set_text_rows
 
 
 class LineListInput(QTextEdit):
@@ -24,7 +26,7 @@ class LineListInput(QTextEdit):
 
     def __init__(self, *, rows: int = 6) -> None:
         super().__init__()
-        self.setFixedHeight(max(80, rows * 24))
+        set_text_rows(self, minimum=min(3, rows), maximum=max(3, rows))
 
     def items(self, *, deduplicate: bool = False) -> list[str]:
         """Return trimmed, non-blank lines without altering visible text."""
@@ -59,9 +61,21 @@ class PathLineInput(QLineEdit):
         self._context_menu_augmenter: Callable[[QMenu], None] | None = None
         self.setAcceptDrops(True)
 
+    def event(self, event):
+        if event.type() == QEvent.Type.ToolTip and self.text():
+            # Preserve instructions as well as the exact, unelided path.
+            text = escape(self.text())
+            if self.toolTip():
+                text += "<br><br>" + escape(self.toolTip())
+            QToolTip.showText(event.globalPos(), text, self)
+            return True
+        return super().event(event)
+
     def path(self) -> Path | None:
         """Return the entered path, or ``None`` for a blank input."""
-        text = self.text().strip()
+        # Whitespace is a valid first or last character of a filesystem name.
+        # Only the truly empty field means no path.
+        text = path_text_from_input(self.text())
         return normalize_path(text) if text else None
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802

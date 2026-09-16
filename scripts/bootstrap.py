@@ -76,6 +76,8 @@ def _build_environment() -> None:
                 "pip",
                 "install",
                 "--no-cache-dir",
+                "--constraint",
+                str(ROOT / "requirements-runtime.lock"),
                 "-e",
                 str(ROOT),
             ],
@@ -92,6 +94,24 @@ def _build_environment() -> None:
         shutil.rmtree(backup)
 
 
+def _launch_application(arguments: list[str]) -> None:
+    """Start the GUI outside the caller's terminal session.
+
+    Environment repair deliberately remains attached to the calling terminal so
+    its confirmation can be answered. A ready GUI must not disappear merely
+    because the terminal or shortcut launcher that started it closes.
+    """
+    subprocess.Popen(
+        [str(VENV_PYTHON), str(ROOT / "scripts" / "main.py"), *arguments],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 def main() -> int:
     needs_setup, reason = _needs_setup()
     if needs_setup:
@@ -102,7 +122,11 @@ def main() -> int:
         except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
             print(f"PORTAの環境を作成できませんでした: {exc}", file=sys.stderr)
             return 1
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(ROOT / "scripts" / "main.py"), *sys.argv[1:]])
+    try:
+        _launch_application(sys.argv[1:])
+    except OSError as exc:
+        print(f"PORTAを独立起動できませんでした: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

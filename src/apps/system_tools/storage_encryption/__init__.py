@@ -1,5 +1,7 @@
-"""Cautious management of encrypted storage without recording secrets."""
+"""Cautious, backend-specific encryption and protected-file workflows."""
 
-from .window import StorageEncryptionScreen, create_screen
+from .hub import EncryptionHubScreen, create_screen
+from .veracrypt_window import VeraCryptScreen
+from .window import StorageEncryptionScreen
 
-__all__ = ["StorageEncryptionScreen", "create_screen"]
+__all__ = ["EncryptionHubScreen", "StorageEncryptionScreen", "VeraCryptScreen", "create_screen"]

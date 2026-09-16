@@ -46,6 +46,30 @@ def test_cross_thread_search_stays_in_load_order_and_reports_invalid_files(tmp_p
     assert [(hit.document_index, hit.reply_number) for hit in hits] == [(0, 3), (1, 3)]
 
 
+def test_cross_thread_search_supports_and_or_exclusion_and_quoted_phrases(tmp_path):
+    path = tmp_path / "search__100_205.txt"
+    text = "\n\n".join(
+        (
+            "[1] A / 2026 / ID:a\n猫と犬",
+            "[2] B / 2026 / ID:b\n猫と鳥",
+            "[3] C / 2026 / ID:c\n犬と鳥 禁止",
+            "[4] D / 2026 / ID:d\n青い 猫を見た",
+        )
+    )
+    document = parse_shitaraba_saved_text(text, path)
+    documents = (document,)
+
+    def numbers(query):
+        return [hit.reply_number for hit in find_text_hits(documents, query)]
+
+    assert numbers("猫 犬") == [1]
+    assert numbers("猫 AND 鳥") == [2]
+    assert numbers("猫 OR 犬") == [1, 2, 3, 4]
+    assert numbers("猫 | 犬 -禁止") == [1, 2, 4]
+    assert numbers("-禁止") == [1, 2, 4]
+    assert numbers('"青い 猫"') == [4]
+
+
 def test_reply_descendant_tree_nests_replies_and_stops_at_depth_limit(tmp_path):
     path = tmp_path / "tree__100_203.txt"
     text = "\n\n".join(

@@ -48,11 +48,11 @@ from media import (
     write_video_catalog,
     wpc_provider_status,
 )
-from foundation.runtime_activity import runtime_activity
-from gui import AppHeader, AppPageLayout
+from runtime.runtime_activity import runtime_activity
+from gui import AppHeader, AppPageLayout, JsonFieldSpec, JsonSettingsEditor
+from gui.layout_policy import preferred_window_size, set_text_rows
 
 from . import settings
-from gui.persistent_settings import create_app_settings_file, show_settings_location_editor
 
 
 class _TaskThread(QThread):
@@ -91,6 +91,11 @@ def _duration_text(value: int | None) -> str:
 class YouTubeDownloaderScreen(QWidget):
     """A non-persistent working screen for two explicit YouTube tasks."""
 
+    def describe_work_state(self):
+        if self._inspected_videos or self._creator_videos:
+            return {"level": 3, "reason": f"確認済み動画{len(self._inspected_videos)}件・収集結果{len(self._creator_videos)}件を保持しています。"}
+        return {"level": 2, "reason": "URL・保存先・取得方法の設定段階です。"}
+
     def __init__(self, return_to_main: Callable[[], None]) -> None:
         super().__init__()
         self._return_to_main = return_to_main
@@ -100,7 +105,7 @@ class YouTubeDownloaderScreen(QWidget):
         self._task: _TaskThread | None = None
         self._collecting_creator = False
         self._settings_dialog: QDialog | None = None
-        self._settings_editor: QTextEdit | None = None
+        self._settings_editor: JsonSettingsEditor | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -126,7 +131,7 @@ class YouTubeDownloaderScreen(QWidget):
         self.notice = QPlainTextEdit()
         self.notice.setReadOnly(True)
         self.notice.setMaximumBlockCount(200)
-        self.notice.setFixedHeight(78)
+        set_text_rows(self.notice, minimum=2, maximum=5)
         self.notice.setPlaceholderText("実行内容と結果をここに表示します。選択してコピーできます。")
         layout.addWidget(self.notice)
 
@@ -137,7 +142,7 @@ class YouTubeDownloaderScreen(QWidget):
         input_layout = QVBoxLayout(input_box)
         self.video_urls_editor = QTextEdit()
         self.video_urls_editor.setPlaceholderText("https://www.youtube.com/watch?v=...\nhttps://youtu.be/...")
-        self.video_urls_editor.setMinimumHeight(100)
+        set_text_rows(self.video_urls_editor, minimum=3)
         input_layout.addWidget(self.video_urls_editor)
         buttons = QHBoxLayout()
         self.inspect_button = QPushButton("情報を確認")
@@ -282,9 +287,8 @@ class YouTubeDownloaderScreen(QWidget):
         header.setStretchLastSection(False)
         header.setSectionResizeMode(1, header.ResizeMode.Stretch)
         header.setSectionResizeMode(2, header.ResizeMode.Stretch)
-        table.setColumnWidth(0, 65)
-        table.setColumnWidth(3, 90)
-        table.setColumnWidth(4, 70)
+        for column in (0, 3, 4):
+            header.setSectionResizeMode(column, header.ResizeMode.ResizeToContents)
         return table
 
     def _refresh_destination_labels(self) -> None:
@@ -374,9 +378,7 @@ class YouTubeDownloaderScreen(QWidget):
         self._set_busy(True)
         self._notify(status)
         def tracked_task() -> object:
-            if activity_label is None:
-                return task()
-            with runtime_activity(activity_label):
+            with runtime_activity(activity_label or "動画情報を確認中"):
                 return task()
 
         thread = _TaskThread(tracked_task, self)
@@ -610,7 +612,7 @@ class YouTubeDownloaderScreen(QWidget):
         if self._settings_dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle("YouTube ダウンローダーの永続設定")
-            dialog.resize(680, 360)
+            dialog.resize(preferred_window_size(dialog))
             layout = QVBoxLayout(dialog)
             self._settings_status_label = QLabel()
             layout.addWidget(self._settings_status_label)
@@ -621,17 +623,27 @@ class YouTubeDownloaderScreen(QWidget):
                     "URL履歴、実行履歴、認証情報は保存しません。"
                 )
             )
-            editor = QTextEdit()
+            editor = JsonSettingsEditor(
+                validate=settings.validate_text,
+                path_keys={
+                    "download_output_directory",
+                    "metadata_export_directory",
+                    "catalog_json_path",
+                },
+                fields={
+                    "download_output_directory": JsonFieldSpec("動画の保存先", "ダウンロードした動画を保存するフォルダです。"),
+                    "metadata_export_directory": JsonFieldSpec("一覧の保存先", "取得した動画情報の一覧を保存するフォルダです。"),
+                    "catalog_json_path": JsonFieldSpec("管理JSONの保存先", "空欄なら、その実行で選んだ動画保存先に従います。"),
+                },
+            )
             layout.addWidget(editor, 1)
             buttons = QDialogButtonBox()
             template_button = buttons.addButton("雛形へ戻す", QDialogButtonBox.ButtonRole.ResetRole)
-            location_button = buttons.addButton("保存先入口", QDialogButtonBox.ButtonRole.ActionRole)
-            create_button = buttons.addButton("保存先・設定を作成", QDialogButtonBox.ButtonRole.ActionRole)
+            editor.bind_edit_button(template_button)
             save_button = buttons.addButton("保存", QDialogButtonBox.ButtonRole.AcceptRole)
+            editor.bind_save_button(save_button)
             close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
             template_button.clicked.connect(lambda: editor.setPlainText(settings.template_text()))
-            location_button.clicked.connect(lambda: show_settings_location_editor(dialog))
-            create_button.clicked.connect(lambda: create_app_settings_file(dialog, settings.create_settings_file))
             save_button.clicked.connect(self.save_settings)
             close_button.clicked.connect(dialog.close)
             layout.addWidget(buttons)
@@ -640,6 +652,7 @@ class YouTubeDownloaderScreen(QWidget):
         assert self._settings_editor is not None
         self._settings_editor.setPlainText(settings.editable_text())
         state, detail = settings.settings_status()
+        self._settings_editor.set_source_state(state, detail)
         self._settings_status_label.setText(f"設定状態: {state} — {detail}")
         self._settings_dialog.show()
         self._settings_dialog.raise_()
